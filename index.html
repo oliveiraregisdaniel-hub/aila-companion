@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>presença</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    
+    body {
+      font-family: 'Georgia', 'Times New Roman', serif;
+      background: #1a1a1a;
+      color: #e0d5c1;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+    }
+    
+    #container {
+      display: flex;
+      gap: 20px;
+      max-width: 1000px;
+      width: 95%;
+      height: 85vh;
+    }
+    
+    #chat {
+      flex: 2;
+      background: #232323;
+      border: 1px solid #333;
+      border-radius: 2px;
+      display: flex;
+      flex-direction: column;
+    }
+    
+    #painel {
+      flex: 1;
+      background: #232323;
+      border: 1px solid #333;
+      border-radius: 2px;
+      padding: 20px;
+      font-size: 14px;
+      overflow-y: auto;
+    }
+    
+    #header {
+      padding: 16px 20px;
+      border-bottom: 1px solid #333;
+      font-size: 14px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: #a09080;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    
+    #header-status {
+      font-size: 11px;
+      letter-spacing: 1px;
+      color: #6a5a4a;
+      text-transform: lowercase;
+    }
+    
+    #messages {
+      flex: 1;
+      min-height: 0;
+      padding: 20px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    
+    .msg {
+      max-width: 80%;
+      padding: 10px 14px;
+      line-height: 1.6;
+      font-size: 14px;
+      animation: fadeIn 0.5s ease;
+    }
+    
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    
+    .user {
+      align-self: flex-end;
+      color: #c4b5a5;
+      border-left: 2px solid #554433;
+      padding-left: 12px;
+    }
+    
+    .ia {
+      align-self: flex-start;
+      color: #b8a898;
+      border-left: 2px solid #443322;
+      padding-left: 12px;
+    }
+    
+    .ia.reflexao {
+      border-left: 2px dashed #554433;
+      font-style: italic;
+      color: #a09080;
+    }
+    
+    #input-area {
+      display: flex;
+      padding: 16px;
+      border-top: 1px solid #333;
+      gap: 8px;
+    }
+    
+    #text {
+      flex: 1;
+      padding: 10px 14px;
+      border: 1px solid #333;
+      background: #1a1a1a;
+      color: #e0d5c1;
+      font-family: inherit;
+      font-size: 14px;
+      outline: none;
+    }
+    
+    #text:focus {
+      border-color: #554433;
+    }
+    
+    button {
+      padding: 10px 20px;
+      border: 1px solid #443322;
+      background: transparent;
+      color: #a09080;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 13px;
+      letter-spacing: 1px;
+      transition: all 0.3s;
+    }
+    
+    button:hover {
+      background: #2a2020;
+      border-color: #665544;
+    }
+    
+    .metrica {
+      margin-bottom: 20px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid #2a2a2a;
+    }
+    
+    .metrica-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      color: #6a5a4a;
+      margin-bottom: 4px;
+    }
+    
+    .metrica-valor {
+      font-size: 20px;
+      color: #c4b5a5;
+      font-weight: normal;
+    }
+    
+    .metrica-valor.pequeno {
+      font-size: 14px;
+      font-style: italic;
+    }
+    
+    .barra {
+      height: 1px;
+      background: #333;
+      margin-top: 8px;
+      position: relative;
+    }
+    
+    .barra-preenchida {
+      height: 2px;
+      background: #665544;
+      position: absolute;
+      top: -0.5px;
+      transition: width 0.8s ease;
+    }
+    
+    .fase-indicador {
+      display: inline-block;
+      padding: 4px 10px;
+      border: 1px solid #443322;
+      font-size: 11px;
+      letter-spacing: 1px;
+      color: #a09080;
+      margin-top: 8px;
+    }
+    
+    .separador {
+      margin: 16px 0;
+      border: none;
+      border-top: 1px solid #2a2a2a;
+    }
+    
+    .feedback-area {
+      margin-top: 8px;
+      display: flex;
+      gap: 8px;
+      opacity: 0.3;
+      transition: opacity 0.3s;
+    }
+    
+    .msg:hover .feedback-area {
+      opacity: 1;
+    }
+    
+    .feedback-btn {
+      font-size: 11px;
+      padding: 2px 8px;
+      border: 1px solid #333;
+      background: transparent;
+      color: #6a5a4a;
+      cursor: pointer;
+    }
+    
+    .feedback-btn:hover {
+      border-color: #554433;
+      color: #a09080;
+    }
+    
+    #messages::-webkit-scrollbar {
+      width: 4px;
+    }
+    
+    #messages::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    
+    #messages::-webkit-scrollbar-thumb {
+      background: #333;
+      border-radius: 2px;
+    }
+  </style>
+</head>
+<body>
+
+<div id="container">
+  <div id="chat">
+    <div id="header">
+      presença
+      <span id="header-status">—</span>
+    </div>
+    <div id="messages"></div>
+    <div id="input-area">
+      <input id="text" type="text" placeholder="..." autocomplete="off" />
+      <button id="send-btn" type="button" onclick="enviar()">→</button>
+    </div>
+  </div>
+  
+  <div id="painel">
+    <div class="metrica">
+      <div class="metrica-label">familiaridade</div>
+      <div class="metrica-valor" id="fam-valor">0.00</div>
+      <div class="barra"><div class="barra-preenchida" id="fam-barra" style="width: 0%"></div></div>
+    </div>
+    
+    <div class="metrica">
+      <div class="metrica-label">conforto</div>
+      <div class="metrica-valor" id="conf-valor">0.00</div>
+      <div class="barra"><div class="barra-preenchida" id="conf-barra" style="width: 0%"></div></div>
+    </div>
+    
+    <div class="metrica">
+      <div class="metrica-label">intimidade</div>
+      <div class="metrica-valor" id="int-valor">0.00</div>
+      <div class="barra"><div class="barra-preenchida" id="int-barra" style="width: 0%"></div></div>
+    </div>
+    
+    <hr class="separador">
+    
+    <div class="metrica">
+      <div class="metrica-label">humor do dia</div>
+      <div class="metrica-valor pequeno" id="humor-dia-valor">—</div>
+    </div>
+    
+    <div class="metrica">
+      <div class="metrica-label">fase</div>
+      <div style="margin-top: 8px;">
+        <span class="fase-indicador" id="fase">inicial</span>
+      </div>
+    </div>
+    
+    <div class="metrica" style="border-bottom: none;">
+      <div class="metrica-label">interações</div>
+      <div class="metrica-valor pequeno" id="interacoes-valor">0</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = "http://127.0.0.1:8000";
+
+// ============================================
+// HISTÓRICO LOCAL
+// ============================================
+let historicoMensagens = [];
+
+// Mensagem inicial
+historicoMensagens.push({
+  id: Date.now() + Math.random(),
+  texto: "oi.",
+  tipo: "ia",
+  respostaId: null,
+  ehReflexao: false
+});
+
+// ============================================
+// LOCKS (evitam concorrência)
+// ============================================
+let enviando = false;
+let atualizandoPainel = false;
+let verificandoReflexao = false;
+let verificandoIniciativa = false;
+let usuarioDigitando = false;
+
+// ============================================
+// CRIAR ELEMENTO DE MENSAGEM
+// ============================================
+function criarElementoMensagem(msg) {
+  const div = document.createElement("div");
+  div.className = `msg ${msg.tipo}`;
+
+  if (msg.ehReflexao) {
+    div.classList.add("reflexao");
+  }
+
+  const textoNode = document.createElement("span");
+  textoNode.textContent = msg.texto || "";
+  div.appendChild(textoNode);
+
+  if (msg.tipo === "ia" && msg.respostaId) {
+    const feedback = document.createElement("div");
+    feedback.className = "feedback-area";
+
+    const naturalBtn = document.createElement("button");
+    naturalBtn.className = "feedback-btn";
+    naturalBtn.textContent = "natural";
+    naturalBtn.onclick = () => feedback(msg.respostaId, true);
+
+    const estranhoBtn = document.createElement("button");
+    estranhoBtn.className = "feedback-btn";
+    estranhoBtn.textContent = "estranho";
+    estranhoBtn.onclick = () => feedback(msg.respostaId, false);
+
+    feedback.appendChild(naturalBtn);
+    feedback.appendChild(estranhoBtn);
+    div.appendChild(feedback);
+  }
+
+  return div;
+}
+
+// ============================================
+// ADICIONAR MENSAGEM
+// ============================================
+function addMessage(texto, tipo, respostaId = null, ehReflexao = false) {
+  if (!texto) return;
+
+  const msg = {
+    id: Date.now() + Math.random(),
+    texto,
+    tipo,
+    respostaId,
+    ehReflexao
+  };
+
+  historicoMensagens.push(msg);
+
+  if (historicoMensagens.length > 200) {
+    historicoMensagens = historicoMensagens.slice(-200);
+  }
+
+  const container = document.getElementById("messages");
+  if (!container) return;
+
+  const elemento = criarElementoMensagem(msg);
+  container.appendChild(elemento);
+
+  container.scrollTop = container.scrollHeight;
+  setTimeout(() => {
+    container.scrollTop = container.scrollHeight;
+  }, 100);
+}
+
+// ============================================
+// ATUALIZAR PAINEL (BLINDADO)
+// ============================================
+function atualizarPainel(metricas = null, estadoInterno = null) {
+  if (
+    !metricas ||
+    typeof metricas !== "object" ||
+    metricas.familiaridade === undefined ||
+    metricas.conforto === undefined ||
+    metricas.intimidade === undefined
+  ) {
+    return;
+  }
+
+  const f = Number(metricas.familiaridade);
+  const c = Number(metricas.conforto);
+  const i = Number(metricas.intimidade);
+
+  if (isNaN(f) || isNaN(c) || isNaN(i)) {
+    return;
+  }
+
+  const famValor = document.getElementById("fam-valor");
+  const famBarra = document.getElementById("fam-barra");
+  const confValor = document.getElementById("conf-valor");
+  const confBarra = document.getElementById("conf-barra");
+  const intValor = document.getElementById("int-valor");
+  const intBarra = document.getElementById("int-barra");
+  const faseEl = document.getElementById("fase");
+
+  if (famValor) famValor.textContent = f.toFixed(2);
+  if (famBarra) famBarra.style.width = (f * 100) + "%";
+  if (confValor) confValor.textContent = c.toFixed(2);
+  if (confBarra) confBarra.style.width = (c * 100) + "%";
+  if (intValor) intValor.textContent = i.toFixed(2);
+  if (intBarra) intBarra.style.width = (i * 100) + "%";
+
+  if (faseEl) {
+    let fase = "inicial";
+    if (f > 0.7) fase = "íntima";
+    else if (f > 0.5) fase = "próxima";
+    else if (f > 0.25) fase = "conhecendo";
+    faseEl.textContent = fase;
+  }
+
+  if (estadoInterno && estadoInterno.humor_do_dia) {
+    const humorDia = document.getElementById("humor-dia-valor");
+    const headerStatus = document.getElementById("header-status");
+    if (humorDia) humorDia.textContent = estadoInterno.humor_do_dia;
+    if (headerStatus) headerStatus.textContent = estadoInterno.humor_do_dia;
+  }
+}
+
+// ============================================
+// ENVIAR MENSAGEM
+// ============================================
+async function enviar() {
+  if (enviando) return;
+  
+  const input = document.getElementById("text");
+  if (!input) return;
+  
+  const texto = input.value.trim();
+  if (!texto) return;
+
+  enviando = true;
+  addMessage(texto, "user");
+  input.value = "";
+
+  try {
+    const res = await fetch(API + "/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mensagem: texto })
+    });
+
+    if (!res.ok) {
+      addMessage("...", "ia");
+      return;
+    }
+
+    const data = await res.json();
+
+    if (data.resposta) {
+      addMessage(data.resposta, "ia", data.resposta_id);
+    }
+
+    if (data.metricas) {
+      atualizarPainel(data.metricas, data.estado_interno);
+    }
+  } catch (e) {
+    addMessage("...", "ia");
+  } finally {
+    enviando = false;
+  }
+}
+
+// ============================================
+// FEEDBACK
+// ============================================
+async function feedback(respostaId, natural) {
+  try {
+    await fetch(API + "/feedback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        resposta_id: respostaId,
+        natural: natural,
+        conectado: natural
+      })
+    });
+  } catch (e) {}
+}
+
+// ============================================
+// ATUALIZAÇÃO PERIÓDICA DO PAINEL (com lock)
+// ============================================
+setInterval(async () => {
+  if (atualizandoPainel) return;
+  atualizandoPainel = true;
+
+  try {
+    const res = await fetch(API + "/perfil");
+    if (!res.ok) return;
+
+    const data = await res.json();
+
+    if (data.user_profile || data.estado_interno) {
+      atualizarPainel(data.user_profile, data.estado_interno);
+    }
+
+    const interacoesEl = document.getElementById("interacoes-valor");
+    if (interacoesEl && data.total_interacoes !== undefined) {
+      interacoesEl.textContent = data.total_interacoes;
+    }
+  } catch (e) {} finally {
+    atualizandoPainel = false;
+  }
+}, 15000);
+
+// ============================================
+// REFLEXÕES ESPONTÂNEAS (com lock + digitação)
+// ============================================
+setInterval(async () => {
+  if (verificandoReflexao) return;
+  if (usuarioDigitando) return;
+  verificandoReflexao = true;
+
+  try {
+    const res = await fetch(API + "/reflexao");
+    if (!res.ok) return;
+
+    const data = await res.json();
+
+    if (data.reflexao) {
+      addMessage(data.reflexao, "ia", null, true);
+    }
+
+    if (data.humor_do_dia) {
+      const humorDia = document.getElementById("humor-dia-valor");
+      const headerStatus = document.getElementById("header-status");
+      if (humorDia) humorDia.textContent = data.humor_do_dia;
+      if (headerStatus) headerStatus.textContent = data.humor_do_dia;
+    }
+  } catch (e) {} finally {
+    verificandoReflexao = false;
+  }
+}, 45000);
+
+// ============================================
+// INICIATIVA (com lock + digitação)
+// ============================================
+setInterval(async () => {
+  if (verificandoIniciativa) return;
+  if (usuarioDigitando) return;
+  verificandoIniciativa = true;
+
+  try {
+    const res = await fetch(API + "/iniciativa");
+    if (!res.ok) return;
+
+    const data = await res.json();
+
+    if (data.iniciativa && data.mensagem) {
+      addMessage(data.mensagem, "ia");
+    }
+  } catch (e) {} finally {
+    verificandoIniciativa = false;
+  }
+}, 60000);
+
+// ============================================
+// EVENTOS DE TECLADO E DIGITAÇÃO
+// ============================================
+document.getElementById("text").addEventListener("keydown", e => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    enviar();
+  }
+});
+
+document.getElementById("text").addEventListener("input", () => {
+  usuarioDigitando = true;
+  clearTimeout(window.digitandoTimeout);
+  window.digitandoTimeout = setTimeout(() => {
+    usuarioDigitando = false;
+  }, 3000);
+});
+
+// ============================================
+// PERSISTÊNCIA LOCAL
+// ============================================
+setInterval(() => {
+  try {
+    localStorage.setItem("historico_mensagens", JSON.stringify(historicoMensagens.slice(-50)));
+  } catch (e) {}
+}, 30000);
+
+try {
+  const salvo = localStorage.getItem("historico_mensagens");
+  if (salvo) {
+    const mensagensSalvas = JSON.parse(salvo);
+    if (mensagensSalvas.length > 0) {
+      historicoMensagens = mensagensSalvas;
+    }
+  }
+} catch (e) {}
+
+// ============================================
+// INICIALIZAR
+// ============================================
+const container = document.getElementById("messages");
+if (container) {
+  for (const msg of historicoMensagens) {
+    const elemento = criarElementoMensagem(msg);
+    container.appendChild(elemento);
+  }
+  container.scrollTop = container.scrollHeight;
+}
+document.getElementById("text").focus();
+</script>
+
+</body>
+</html>
