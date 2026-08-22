@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 from openai import OpenAI
@@ -2170,11 +2171,7 @@ app.add_middleware(
  
 @app.get("/")
 async def root():
-    return {
-        "status": "Aila online",
-        "familiaridade": user_profile["familiaridade"],
-        "humor_do_dia": estado_interno["pequenas_variacoes"]["humor_do_dia"]
-    }
+    return FileResponse("index.html")
  
 @app.post("/chat")
 async def chat(req: ChatRequest):
