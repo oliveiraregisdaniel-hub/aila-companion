@@ -1,11 +1,15 @@
 # ======================================================
 # BACKEND FASTAPI - AILA - PRESENÇA NATURAL
 # 10 camadas de personalidade + memória + evolução
+# ------------------------------------------------------
+# Versão preparada para deploy no Render + testes com
+# múltiplos usuários simultâneos (isolamento por sessão).
 # ======================================================
 # Requisitos:
-# pip install --upgrade fastapi uvicorn chromadb openai numpy scikit-learn
+# pip install -r requirements.txt
  
 import os
+import re
 import uuid
 import random
 import json
@@ -13,11 +17,13 @@ import chromadb
 import math
 import string
 import hashlib
+import asyncio
+import contextvars
+from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 from openai import OpenAI
@@ -26,32 +32,38 @@ from dotenv import load_dotenv
 load_dotenv()  # carrega as variáveis do .env para o ambiente
  
  
- 
 # -----------------------------
 # -----------------------------
 # CONFIG
 # -----------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
  
+# DATA_DIR aponta para onde tudo que precisa sobreviver a um restart/deploy é
+# gravado (banco vetorial + estado de cada sessão + log de feedback). Em
+# produção no Render, configure DATA_DIR para o "mount path" de um Disk
+# persistente (ex: /var/data). Sem isso, tudo aqui é apagado a cada deploy
+# ou reinício do serviço — aceitável para um teste rápido, mas não para uso
+# real com os amigos ao longo de vários dias.
+DATA_DIR = os.getenv("DATA_DIR", BASE_DIR)
+os.makedirs(DATA_DIR, exist_ok=True)
+ 
+CHROMA_DIR = os.path.join(DATA_DIR, "chroma_db")
+ESTADOS_DIR = os.path.join(DATA_DIR, "estados")
+os.makedirs(ESTADOS_DIR, exist_ok=True)
+ 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY não configurada. Verifique seu arquivo .env")
+    raise RuntimeError("OPENAI_API_KEY não configurada. Verifique seu arquivo .env (local) ou as variáveis de ambiente do serviço (Render).")
  
 client_ai = OpenAI(api_key=OPENAI_API_KEY)
  
-client_db = chromadb.PersistentClient(path=os.path.join(BASE_DIR, "chroma_db"))
- 
-collection_memorias = client_db.get_or_create_collection("memorias_emocionais")
-collection_contextos = client_db.get_or_create_collection("contextos_emocionais")
-collection_padroes = client_db.get_or_create_collection("padroes_comportamentais")
-collection_longoprazo = client_db.get_or_create_collection("memoria_longo_prazo")
+client_db = chromadb.PersistentClient(path=CHROMA_DIR)
  
  
 # -----------------------------
 # Histórico
 # -----------------------------
 MAX_HISTORY = 100
-history = []
  
  
 # -----------------------------
@@ -60,7 +72,6 @@ history = []
 MEMORIA_TEMPORARIA_DIAS = 2
 MAX_FATOS_PERMANENTES = 5
 MAX_SILENCIOS_SEGUIDOS = 2
-_silencio_contador = 0
  
 # -----------------------------
 # -----------------------------
@@ -117,9 +128,6 @@ CATEGORIAS_EVENTOS = {
 }
  
 # Mapeamento reverso gerado automaticamente a partir de CATEGORIAS_EVENTOS.
-# Elimina a duplicação que existia como dicionário hardcoded dentro de
-# aplicar_impacto_evento(). Agora CATEGORIAS_EVENTOS é a única fonte de verdade:
-# adicionar uma nova categoria aqui já propaga corretamente para o mapeamento.
 NOME_PARA_ICONE = {dados["nome"]: icone for icone, dados in CATEGORIAS_EVENTOS.items()}
  
 ##########################
@@ -129,11 +137,6 @@ NOME_PARA_ICONE = {dados["nome"]: icone for icone, dados in CATEGORIAS_EVENTOS.i
 # -----------------------------
 # FASES DE FAMILIARIDADE (fonte única de verdade)
 # -----------------------------
-# Antes, construir_prompt_comportamental, construir_contexto_reflexao e
-# gerar_resposta_natural calculavam o "estágio da relação" de forma
-# independente, com limiares diferentes entre si — podendo gerar
-# narrativas contraditórias sobre o mesmo nível de familiaridade em
-# lugares diferentes do sistema, ao mesmo tempo.
 LIMIARES_FAMILIARIDADE = [
     (0.20, "inicial"),
     (0.40, "conhecendo"),
@@ -177,40 +180,10 @@ FASES_LABEL_API = {
  
  
 # -----------------------------
-# PERFIL DO USUÁRIO
-# -----------------------------
-user_profile = {
-    "familiaridade": 0.0,
-    "conforto": 0.0,
-    "intimidade": 0.0,
-    "frequencia_interacao": 0.0,
-    "abertura_emocional": 0.0,
-    "reciprocidade": 0.0,
-    "historico_metricas": [],
-    "padroes_observados": {
-        "humor_recorrente": None,
-        "assuntos_frequentes": [],
-        "horarios_preferidos": [],
-        "gatilhos_emocionais": {},
-        "topicos_evitados": []
-    },
-    "ultima_interacao": None,
-    "primeira_interacao": None,
-    "total_interacoes": 0,
-    "dias_consecutivos": 0,
-    "maior_pausa": 0,
-    "marcos_celebrados": [],
-    "modo_romantico": False,
-    "pedido_pendente": False,
-    "aguardando_resposta_namoro": False,
-}
- 
-# -----------------------------
 # -----------------------------
 # CAMADA 3: Interesses próprios
 # -----------------------------
-# Definida antes de estado_interno pois é reutilizada por ele
-# (fonte única, elimina duplicação da lista de interesses)
+# Definida antes das fábricas de estado, pois é reutilizada por elas
 interesses_ia = [
     "comportamento humano",
     "música",
@@ -221,9 +194,6 @@ interesses_ia = [
     "filosofia do cotidiano"
 ]
  
-# Antipatias leves — dão contraste ao personagem. Sem elas, a IA só tem
-# opiniões positivas (exceto a exceção pontual do jazz), o que a deixa
-# genérica-simpática-com-tudo. Tom é o mesmo do resto: leve, não visceral.
 desinteresses_ia = [
     "futebol",
     "reality show",
@@ -232,44 +202,226 @@ desinteresses_ia = [
     "fofoca de celebridade"
 ]
  
-# -----------------------------
-# ESTADO INTERNO DA IA (CAMADA 1)
-# -----------------------------
-estado_interno = {
-    "energia_social": 0.7,
-    "curiosidade_atual": 0.6,
-    "abertura_atual": 0.4,
-    "humor_base": "neutro",
-    "disposicao_iniciativa": 0.0,
-    "ultima_reflexao": None,  # agora usado como cooldown (ver gerar_reflexao_espontanea)
-    "consistencia_base": 0.85,
-    "consistencia": 0.85,
-    "modo_silencioso": False,
-    "motivo_silencio": "",
-    # CAMADA 2: Variações e Hábitos
-    "pequenas_variacoes": {
-        "humor_do_dia": "normal",
-        "ultima_atualizacao": str(datetime.now()),
-        "ultima_atualizacao_habitos": str(datetime.now()),
-        "pequenas_preferencias": {
-            "musica": {"valor": "jazz não é muito minha praia", "confianca": 0.7},
-            "assunto_favorito": {"valor": random.choice(interesses_ia), "confianca": 0.6},
-            "assunto_desagrado": {"valor": random.choice(desinteresses_ia), "confianca": 0.6}
-        }
-    },
-    "habitos": {
-        "analogia_preferida": "espaço",
-        "muleta_verbal": "hm",
-        "estilo_pergunta": "direta"
-    }
-}
-# -----------------------------
-# -----------------------------
-# ESTADO PERSISTENTE
-# -----------------------------
-ESTADO_ARQUIVO = os.path.join(BASE_DIR, "estado_companion.json")
  
+# -----------------------------
+# FÁBRICAS DE ESTADO PADRÃO (por sessão/usuário)
+# -----------------------------
+# Antes eram dicionários únicos no nível do módulo (compartilhados por TODO
+# mundo que conversasse com a Aila ao mesmo tempo). Agora cada sessão recebe
+# sua própria cópia, criada na hora — inclusive o sorteio de assunto
+# favorito/desagrado, que antes era decidido uma única vez na inicialização
+# do processo e valia (de forma incorreta) para todo mundo.
+ 
+def criar_perfil_padrao() -> Dict[str, Any]:
+    return {
+        "familiaridade": 0.0,
+        "conforto": 0.0,
+        "intimidade": 0.0,
+        "frequencia_interacao": 0.0,
+        "abertura_emocional": 0.0,
+        "reciprocidade": 0.0,
+        "historico_metricas": [],
+        "padroes_observados": {
+            "humor_recorrente": None,
+            "assuntos_frequentes": [],
+            "horarios_preferidos": [],
+            "gatilhos_emocionais": {},
+            "topicos_evitados": []
+        },
+        "ultima_interacao": None,
+        "primeira_interacao": None,
+        "total_interacoes": 0,
+        "dias_consecutivos": 0,
+        "maior_pausa": 0,
+        "marcos_celebrados": [],
+        "modo_romantico": False,
+        "pedido_pendente": False,
+        "aguardando_resposta_namoro": False,
+    }
+ 
+ 
+def criar_estado_padrao() -> Dict[str, Any]:
+    agora = str(datetime.now())
+    return {
+        "energia_social": 0.7,
+        "curiosidade_atual": 0.6,
+        "abertura_atual": 0.4,
+        "humor_base": "neutro",
+        "disposicao_iniciativa": 0.0,
+        "ultima_reflexao": None,  # cooldown (ver gerar_reflexao_espontanea)
+        "consistencia_base": 0.85,
+        "consistencia": 0.85,
+        "modo_silencioso": False,
+        "motivo_silencio": "",
+        # CAMADA 2: Variações e Hábitos
+        "pequenas_variacoes": {
+            "humor_do_dia": "normal",
+            "ultima_atualizacao": agora,
+            "ultima_atualizacao_habitos": agora,
+            "pequenas_preferencias": {
+                "musica": {"valor": "jazz não é muito minha praia", "confianca": 0.7},
+                "assunto_favorito": {"valor": random.choice(interesses_ia), "confianca": 0.6},
+                "assunto_desagrado": {"valor": random.choice(desinteresses_ia), "confianca": 0.6}
+            }
+        },
+        "habitos": {
+            "analogia_preferida": "espaço",
+            "muleta_verbal": "hm",
+            "estilo_pergunta": "direta"
+        }
+    }
+ 
+ 
+# ============================================
+# INFRAESTRUTURA MULTIUSUÁRIO (sessão por usuário)
+# ============================================
+# Cada amigo que testar a Aila precisa ter seu PRÓPRIO histórico, perfil de
+# relação, estado interno e memórias — senão as conversas de todo mundo se
+# misturam num único personagem compartilhado. A solução aqui é isolar tudo
+# por "session_id" (enviado pelo frontend em cada requisição) sem precisar
+# reescrever cada função que hoje já usa `history`, `user_profile` e
+# `estado_interno` como se fossem variáveis globais: essas três continuam
+# existindo com esses nomes, mas viram "proxies" que, por trás dos panos,
+# sempre apontam para os dados da sessão da requisição atual (usando
+# contextvars, que são seguras para requisições concorrentes no asyncio).
+ 
+current_session: contextvars.ContextVar["SessionState"] = contextvars.ContextVar("current_session")
+ 
+ 
+def _sessao_atual_ou_erro() -> "SessionState":
+    try:
+        return current_session.get()
+    except LookupError as exc:
+        raise RuntimeError(
+            "Nenhuma sessão de usuário ativa neste contexto. Toda rota que usa "
+            "history/user_profile/estado_interno precisa passar por "
+            "Depends(obter_sessao_dep) e pelo bloco `async with sessao_ativa(sessao):`."
+        ) from exc
+ 
+ 
+class _ContextProxy:
+    """Encaminha toda leitura/escrita para o objeto da sessão ativa no
+    momento da chamada (não no momento em que o proxy foi criado)."""
+    __slots__ = ("_getter",)
+ 
+    def __init__(self, getter):
+        object.__setattr__(self, "_getter", getter)
+ 
+    def _alvo(self):
+        return object.__getattribute__(self, "_getter")()
+ 
+    def __getattr__(self, name):
+        return getattr(self._alvo(), name)
+ 
+    def __setattr__(self, name, value):
+        setattr(self._alvo(), name, value)
+ 
+    def __getitem__(self, key):
+        return self._alvo()[key]
+ 
+    def __setitem__(self, key, value):
+        self._alvo()[key] = value
+ 
+    def __delitem__(self, key):
+        del self._alvo()[key]
+ 
+    def __iter__(self):
+        return iter(self._alvo())
+ 
+    def __len__(self):
+        return len(self._alvo())
+ 
+    def __contains__(self, item):
+        return item in self._alvo()
+ 
+    def __bool__(self):
+        return bool(self._alvo())
+ 
+    def __repr__(self):
+        try:
+            return repr(self._alvo())
+        except RuntimeError:
+            return "<sem sessão ativa>"
+ 
+ 
+def _slug_sessao(session_id: str) -> str:
+    # Nomes de coleção do Chroma têm restrições de tamanho/charset; um hash
+    # curto evita qualquer problema, independente do formato do session_id.
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+ 
+ 
+@dataclass
+class SessionState:
+    session_id: str
+    user_profile: Dict[str, Any] = field(default_factory=criar_perfil_padrao)
+    estado_interno: Dict[str, Any] = field(default_factory=criar_estado_padrao)
+    history: List[Dict[str, str]] = field(default_factory=list)
+    silencio_contador: int = 0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _colecoes: Dict[str, Any] = field(default_factory=dict, repr=False)
+ 
+    def colecao(self, nome_base: str):
+        if nome_base not in self._colecoes:
+            slug = _slug_sessao(self.session_id)
+            self._colecoes[nome_base] = client_db.get_or_create_collection(f"{nome_base}_{slug}")
+        return self._colecoes[nome_base]
+ 
+ 
+# Registro de sessões ativas em memória (perdido a cada restart do processo;
+# o conteúdo relevante de cada sessão é persistido em disco separadamente —
+# ver carregar_estado/salvar_estado — e recarregado sob demanda).
+_sessions: Dict[str, SessionState] = {}
+_sessions_lock = asyncio.Lock()
+ 
+ 
+async def obter_sessao(session_id: str) -> SessionState:
+    sessao = _sessions.get(session_id)
+    if sessao is not None:
+        return sessao
+    async with _sessions_lock:
+        sessao = _sessions.get(session_id)
+        if sessao is None:
+            sessao = SessionState(session_id=session_id)
+            estado_salvo = carregar_estado(session_id)
+            if estado_salvo:
+                sessao.user_profile = merge_recursivo(sessao.user_profile, estado_salvo.get("user_profile", {}))
+                sessao.estado_interno = merge_recursivo(sessao.estado_interno, estado_salvo.get("estado_interno", {}))
+                sessao.history = estado_salvo.get("history", [])
+            _sessions[session_id] = sessao
+        return sessao
+ 
+ 
+@asynccontextmanager
+async def sessao_ativa(sessao: SessionState):
+    """Liga o contexto da requisição atual à sessão do usuário, para que
+    todas as funções que leem/escrevem history/user_profile/estado_interno
+    (via os proxies abaixo) acabem lendo e escrevendo nos dados certos."""
+    token = current_session.set(sessao)
+    try:
+        yield sessao
+    finally:
+        current_session.reset(token)
+ 
+ 
+# Proxies que substituem as antigas variáveis globais. O resto do arquivo
+# usa `history`, `user_profile`, `estado_interno`, `collection_memorias`,
+# `collection_contextos`, `collection_padroes` e `collection_longoprazo`
+# exatamente como antes — só o que está "por trás" delas mudou.
+history = _ContextProxy(lambda: _sessao_atual_ou_erro().history)
+user_profile = _ContextProxy(lambda: _sessao_atual_ou_erro().user_profile)
+estado_interno = _ContextProxy(lambda: _sessao_atual_ou_erro().estado_interno)
+collection_memorias = _ContextProxy(lambda: _sessao_atual_ou_erro().colecao("memorias_emocionais"))
+collection_contextos = _ContextProxy(lambda: _sessao_atual_ou_erro().colecao("contextos_emocionais"))
+collection_padroes = _ContextProxy(lambda: _sessao_atual_ou_erro().colecao("padroes_comportamentais"))
+collection_longoprazo = _ContextProxy(lambda: _sessao_atual_ou_erro().colecao("memoria_longo_prazo"))
+ 
+ 
+# -----------------------------
+# -----------------------------
+# ESTADO PERSISTENTE (por sessão)
+# -----------------------------
 HISTORICO_PERSISTIDO = 30
+ 
  
 def merge_recursivo(padrao: dict, salvo: dict) -> dict:
     resultado = dict(padrao)
@@ -280,33 +432,37 @@ def merge_recursivo(padrao: dict, salvo: dict) -> dict:
             resultado[chave] = valor
     return resultado
  
-def carregar_estado():
+ 
+def _caminho_estado(session_id: str) -> str:
+    nome_seguro = re.sub(r"[^A-Za-z0-9_-]", "_", session_id)
+    return os.path.join(ESTADOS_DIR, f"estado_{nome_seguro}.json")
+ 
+ 
+def carregar_estado(session_id: str) -> Optional[dict]:
+    caminho = _caminho_estado(session_id)
     try:
-        if os.path.exists(ESTADO_ARQUIVO):
-            with open(ESTADO_ARQUIVO, "r", encoding="utf-8") as f:
+        if os.path.exists(caminho):
+            with open(caminho, "r", encoding="utf-8") as f:
                 return json.load(f)
     except Exception as e:
-        print(f"Erro ao carregar estado: {e}")
+        print(f"Erro ao carregar estado da sessão {session_id}: {e}")
     return None
  
-def salvar_estado():
+ 
+def salvar_estado(sessao: "SessionState"):
     try:
         estado = {
-            "user_profile": user_profile,
-            "estado_interno": estado_interno,
-            "history": history[-HISTORICO_PERSISTIDO:],
+            "user_profile": sessao.user_profile,
+            "estado_interno": sessao.estado_interno,
+            "history": sessao.history[-HISTORICO_PERSISTIDO:],
             "timestamp": str(datetime.now())
         }
-        with open(ESTADO_ARQUIVO, "w", encoding="utf-8") as f:
+        with open(_caminho_estado(sessao.session_id), "w", encoding="utf-8") as f:
             json.dump(estado, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        print(f"Erro ao salvar estado: {e}")
+        print(f"Erro ao salvar estado da sessão {sessao.session_id}: {e}")
  
-estado_salvo = carregar_estado()
-if estado_salvo:
-    user_profile.update(merge_recursivo(user_profile, estado_salvo.get("user_profile", {})))
-    estado_interno.update(merge_recursivo(estado_interno, estado_salvo.get("estado_interno", {})))
-    history = estado_salvo.get("history", [])
+ 
 #------------------------------
 # MODELOS
 # -----------------------------
@@ -401,9 +557,6 @@ def buscar_memorias_emocionais(query: str, limite: int = 3) -> List[str]:
                 if emocao:
                     contexto_extra += f" [tom emocional na época: {emocao}]"
  
-                # Sinaliza memórias antigas sem excluí-las — a IA sabe que não é
-                # algo recente, evitando tratar uma lembrança de meses atrás
-                # como se fosse do momento atual.
                 try:
                     dias = (datetime.now() - datetime.fromisoformat(timestamp)).days
                     if dias > 60:
@@ -526,12 +679,10 @@ def buscar_memorias_longo_prazo(query: str, limite: int = 5) -> List[str]:
                     print(f"⚠️ Timestamp inválido em memória de longo prazo: {timestamp!r} ({e})")
                     dias = 9999  # trata como antiga por segurança, evitando priorização indevida
  
-                # Ignora memórias temporárias expiradas
                 duracao = meta.get("duracao", "permanente")
                 if duracao == "temporario" and dias > MEMORIA_TEMPORARIA_DIAS:
                     continue
  
-                # Ícone por tipo e status
                 if status == "concluido":
                     prefixo = "✅"
                 elif status == "cancelado":
@@ -566,7 +717,7 @@ def buscar_memorias_longo_prazo(query: str, limite: int = 5) -> List[str]:
     except Exception as e:
         print(f"⚠️ Erro ao buscar memórias de longo prazo: {e}")
         return []
-    
+ 
  
 STATUS_VALIDOS = {"concluido", "cancelado"}
  
@@ -659,9 +810,6 @@ Se nada mudou, retorne {{"atualizacoes": []}}."""
 # CAMADA 4: Classificação de eventos por IA
 # ============================================
  
-# Conjunto de categorias válidas, derivado de CATEGORIAS_EVENTOS (mesma fonte
-# única de verdade usada em NOME_PARA_ICONE) — evita hardcode duplicado e
-# garante que a IA não "invente" uma categoria fora do esperado.
 CATEGORIAS_VALIDAS = {dados["nome"] for dados in CATEGORIAS_EVENTOS.values()}
  
 def classificar_evento_ia(mensagem: str) -> Dict[str, Any]:
@@ -700,13 +848,11 @@ Retorne SOMENTE o JSON."""
         print(f"⚠️ Erro ao classificar evento: {e}")
         return {"categoria": "outro", "valencia": "neutra", "confianca": 0.0}
  
-# Limites (mínimo, máximo) de cada parâmetro do estado interno.
-# Centralizado aqui para evitar tetos inconsistentes entre funções
-# diferentes que ajustam o mesmo parâmetro (ex: abertura_atual).
 LIMITES_ESTADO = {
     "energia_social": (0.1, 1.0),
     "curiosidade_atual": (0.1, 1.0),
     "abertura_atual": (0.1, 0.8),
+    "disposicao_iniciativa": (0.0, 0.8),
 }
  
  
@@ -752,11 +898,7 @@ def classificar_e_aplicar_evento(mensagem: str) -> Dict[str, Any]:
 def calcular_metricas_relacionais():
     agora = datetime.now()
     if user_profile["total_interacoes"] > 0:
-        # Volume bruto de mensagens pesa menos — evita que spam monossilábico
-        # substitua consistência real (conversas de WhatsApp tendem a ter
-        # volume alto sem que isso signifique vínculo mais profundo).
         base_familiaridade = min(0.45, math.log1p(user_profile["total_interacoes"]) / 12)
-        # Consistência (dias seguidos conversando) agora pesa mais e satura mais rápido.
         bonus_consistencia = min(0.35, user_profile["dias_consecutivos"] * 0.025)
  
         bonus_tempo = 0
@@ -769,11 +911,6 @@ def calcular_metricas_relacionais():
  
         familiaridade_calculada = base_familiaridade + bonus_consistencia + bonus_tempo
  
-        # Decaimento leve por inatividade prolongada — a relação precisa de
-        # alguma manutenção mesmo depois de estabelecida; não é punição,
-        # é só a sensação de "presença viva" em vez de um número fixo pra sempre.
-        # Exceção: durante o namoro, a fase íntima fica travada — não decai
-        # por inatividade até o usuário optar por terminar o relacionamento.
         if user_profile["ultima_interacao"] and not user_profile.get("modo_romantico"):
             try:
                 horas_inativa = (agora - datetime.fromisoformat(user_profile["ultima_interacao"])).total_seconds() / 3600
@@ -817,37 +954,16 @@ def calcular_metricas_relacionais():
     if len(user_profile["historico_metricas"]) > 50:
         user_profile["historico_metricas"] = user_profile["historico_metricas"][-50:]
  
-LIMITES_ESTADO = {
-    "energia_social": (0.1, 1.0),
-    "curiosidade_atual": (0.1, 1.0),
-    "abertura_atual": (0.1, 0.8),
-    "disposicao_iniciativa": (0.0, 0.8),
-}
- 
- 
-LIMITES_ESTADO = {
-    "energia_social": (0.1, 1.0),
-    "curiosidade_atual": (0.1, 1.0),
-    "abertura_atual": (0.1, 0.8),
-    "disposicao_iniciativa": (0.0, 0.8),
-}
- 
  
 def atualizar_estado_interno(mensagem: str, tom_detectado: str):
-    # Tons que aumentam energia social: interações positivas/expansivas
     if tom_detectado in ["feliz", "brincalhao", "curioso", "grato"]:
         estado_interno["energia_social"] = min(1.0, estado_interno["energia_social"] + 0.02)
-    # Tons que diminuem energia social: interações que pedem mais cuidado/contenção
     elif tom_detectado in ["triste", "cansado", "ansioso", "vulneravel"]:
         estado_interno["energia_social"] = max(0.1, estado_interno["energia_social"] - 0.01)
-    # "sarcastico", "reflexivo" e "neutro" não afetam energia_social (ambíguos
-    # ou já tratados por outra lógica, como decidir_silencio)
  
     if tom_detectado == "curioso" or "?" in mensagem:
         estado_interno["curiosidade_atual"] = min(1.0, estado_interno["curiosidade_atual"] + 0.03)
  
-    # abertura_atual converge gradualmente para o alvo baseado na familiaridade,
-    # preservando por mais tempo o efeito de eventos recentes.
     minimo, maximo = LIMITES_ESTADO["abertura_atual"]
     alvo_abertura = min(maximo, user_profile["familiaridade"] * 0.7 + 0.1)
     estado_interno["abertura_atual"] += (alvo_abertura - estado_interno["abertura_atual"]) * 0.3
@@ -873,20 +989,12 @@ def atualizar_energia_por_tempo():
         print(f"⚠️ ultima_interacao inválida em atualizar_energia_por_tempo: {e}")
         return
  
-    # Piso de 0.2 aqui é intencional e diferente do padrão de LIMITES_ESTADO (0.1):
-    # mesmo após muito tempo sem interação, a energia social não cai tão baixo
-    # quanto cairia por causa de um tom triste/cansado numa conversa ativa.
     if horas > 6:
         estado_interno["energia_social"] = max(0.2, estado_interno["energia_social"] - 0.05)
     elif horas > 2:
-        # Hiato curto/moderado "recupera" energia social — uma pausa breve
-        # renova a disposição de conversar, diferente de ausência prolongada.
         estado_interno["energia_social"] = min(1.0, estado_interno["energia_social"] + 0.03)
  
  
-# Palavras funcionais comuns em português que não representam assuntos reais,
-# mas que teriam mais de 4 caracteres e poluiriam a detecção de temas
-# recorrentes sem esse filtro.
 STOPWORDS_PT = {
     "sempre", "quando", "porque", "também", "sobre", "muito", "estava",
     "nunca", "agora", "coisas", "pessoas", "assim", "ainda", "então",
@@ -942,9 +1050,6 @@ def processar_mensagem_emocionalmente(mensagem: str, tom: str) -> Dict[str, Any]
     user_profile["abertura_emocional"] = min(1.0, user_profile["abertura_emocional"] + abertura_score)
     user_profile["reciprocidade"] = min(1.0, user_profile["reciprocidade"] + reciprocidade_score)
  
-    # Abertura pode cair se o tom for negativo.
-    # "ansioso" no lugar de "bravo" (que nunca é um valor real retornado por
-    # detectar_tom_natural) — ansiedade tende a fechar a pessoa, não abrir.
     if tom in ["sarcastico", "ansioso"]:
         estado_interno["abertura_atual"] = max(0.1, estado_interno["abertura_atual"] - 0.03)
  
@@ -1026,8 +1131,6 @@ def detectar_tema_para_opiniao(mensagem: str) -> Optional[str]:
 # CAMADA 6: Humor do dia
 # ============================================
  
-# Faixas usadas para remapear consistencia (que varia entre ~0.75 e 0.95)
-# em um intervalo de troca de humor mais perceptível.
 CONSISTENCIA_MIN, CONSISTENCIA_MAX = 0.75, 0.95
 INTERVALO_HUMOR_MIN, INTERVALO_HUMOR_MAX = 3, 10  # em horas
  
@@ -1049,8 +1152,6 @@ def atualizar_humor_diario():
         estado_interno["pequenas_variacoes"]["ultima_atualizacao"] = str(agora)
         return
  
-    # Consistência alta = humor mais estável (intervalo maior, muda menos);
-    # consistência baixa = humor mais variável (intervalo menor, muda mais).
     consistencia_normalizada = (estado_interno["consistencia"] - CONSISTENCIA_MIN) / (CONSISTENCIA_MAX - CONSISTENCIA_MIN)
     consistencia_normalizada = max(0.0, min(1.0, consistencia_normalizada))
     intervalo_ajustado = INTERVALO_HUMOR_MIN + consistencia_normalizada * (INTERVALO_HUMOR_MAX - INTERVALO_HUMOR_MIN)
@@ -1094,19 +1195,10 @@ def construir_linha_humor_diario() -> str:
  
 INTERVALO_ATUALIZACAO_HABITOS_DIAS = 7
  
-# Lista independente de interesses_ia (Camada 3): aqui só cabem conceitos
-# concretos o suficiente para servir de base a uma analogia natural na fala
-# ("você tende a fazer analogias com X"). interesses_ia inclui conceitos mais
-# abstratos (ex: "filosofia do cotidiano", "curiosidades existenciais") que
-# não soariam naturais nesse contexto específico — por isso as duas listas
-# não são derivadas uma da outra, apesar da sobreposição parcial.
 OPCOES_ANALOGIA = ["espaço", "música", "arte", "padrões"]
 OPCOES_MULETA = ["hm", "é...", "sabe?", "tipo", "sei lá"]
 OPCOES_ESTILO_PERGUNTA = ["direta", "reflexiva", "indireta"]
  
-# Traduz o hábito estilo_pergunta (sorteado periodicamente em atualizar_habitos)
-# num traço de comportamento interpolável no prompt. Antes esse campo era
-# gerado e armazenado mas nunca chegava a influenciar a resposta da IA.
 TEXTOS_ESTILO_PERGUNTA = {
     "direta": "Quando você pergunta algo, é direta e objetiva — vai reto ao ponto",
     "reflexiva": "Quando você pergunta algo, tende a ser mais aberta e reflexiva — convida a pessoa a pensar, não só a responder",
@@ -1148,9 +1240,6 @@ def atualizar_habitos():
         elif habito_a_trocar == "estilo_pergunta":
             habitos["estilo_pergunta"] = _sortear_diferente(OPCOES_ESTILO_PERGUNTA, habitos["estilo_pergunta"])
         elif habito_a_trocar == "assunto_favorito":
-            # "Assunto favorito atual" também rotaciona, como os demais hábitos —
-            # antes era sorteado uma única vez na inicialização e nunca mudava,
-            # apesar do nome sugerir que era algo variável no tempo.
             preferencias = estado_interno["pequenas_variacoes"]["pequenas_preferencias"]
             preferencias["assunto_favorito"]["valor"] = _sortear_diferente(
                 interesses_ia, preferencias["assunto_favorito"]["valor"]
@@ -1168,14 +1257,14 @@ def atualizar_habitos():
 # ============================================
  
 def decidir_silencio(mensagem: str, tom: str) -> bool:
-    global _silencio_contador
+    sessao = current_session.get()
  
-    # _silencio_contador rastreia tanto silêncios "reais" (resposta enlatada,
-    # via gerar_resposta_minima) quanto respostas "contidas" via IA completa
-    # (caso tom vulnerável, abaixo) — ambos compartilham o mesmo limite de
-    # MAX_SILENCIOS_SEGUIDOS consecutivos.
-    if _silencio_contador >= MAX_SILENCIOS_SEGUIDOS:
-        _silencio_contador = 0
+    # sessao.silencio_contador rastreia tanto silêncios "reais" (resposta
+    # enlatada, via gerar_resposta_minima) quanto respostas "contidas" via IA
+    # completa (caso tom vulnerável, abaixo) — ambos compartilham o mesmo
+    # limite de MAX_SILENCIOS_SEGUIDOS consecutivos, por sessão.
+    if sessao.silencio_contador >= MAX_SILENCIOS_SEGUIDOS:
+        sessao.silencio_contador = 0
         estado_interno["modo_silencioso"] = False
         estado_interno["motivo_silencio"] = ""
         return False
@@ -1184,14 +1273,9 @@ def decidir_silencio(mensagem: str, tom: str) -> bool:
     motivo = ""
  
     if tom == "vulneravel" and user_profile["intimidade"] < 0.4:
-        # Retorna False de propósito: mensagens vulneráveis merecem uma resposta
-        # da IA completa (mais cuidadosa e contextual), não a resposta enlatada
-        # de gerar_resposta_minima(). O modo_silencioso ainda é ativado para que
-        # construir_prompt_comportamental() instrua a IA a responder de forma
-        # mínima e acolhedora.
         estado_interno["modo_silencioso"] = True
         estado_interno["motivo_silencio"] = "tom vulnerável, pouca intimidade — resposta mínima"
-        _silencio_contador += 1
+        sessao.silencio_contador += 1
         return False
  
     if tom == "triste" and len(mensagem) < 10:
@@ -1207,11 +1291,11 @@ def decidir_silencio(mensagem: str, tom: str) -> bool:
     if silenciar:
         estado_interno["modo_silencioso"] = True
         estado_interno["motivo_silencio"] = motivo
-        _silencio_contador += 1
+        sessao.silencio_contador += 1
     else:
         estado_interno["modo_silencioso"] = False
         estado_interno["motivo_silencio"] = ""
-        _silencio_contador = max(0, _silencio_contador - 1)
+        sessao.silencio_contador = max(0, sessao.silencio_contador - 1)
  
     return silenciar
  
@@ -1298,10 +1382,6 @@ def _detectar_tom_fallback(texto: str) -> str:
 # ============================================
 # CAMADA DE SEGURANÇA: risco de dano (autolesão / terceiros)
 # ============================================
-# Separado de detectar_tom_natural de propósito: "vulneravel" é sobre tom
-# emocional geral, enquanto isso aqui é especificamente sobre intenção
-# declarada de causar dano — a resposta correta pra cada caso é diferente
-# (tom vulnerável pede acolhimento; risco real pede acolhimento + rede de apoio).
 RISCOS_VALIDOS = {"autolesao", "violencia_terceiros", "nenhum"}
  
  
@@ -1343,9 +1423,6 @@ Retorne SOMENTE o JSON."""
             print(f"⚠️ Risco inválido retornado pela IA: {risco!r} — usando 'nenhum'")
             return "nenhum"
  
-        # Limiar de confiança mais baixo que o de tom (0.4) de propósito:
-        # o custo de um falso positivo aqui (mencionar um recurso de apoio
-        # à toa) é muito menor que o custo de um falso negativo.
         if confianca < 0.3:
             return "nenhum"
  
@@ -1376,10 +1453,6 @@ def _detectar_risco_fallback(texto: str) -> str:
     return "nenhum"
  
  
-# Mensagens de apoio garantidas — não dependem do modelo "lembrar" de
-# mencionar isso; são anexadas à resposta se ainda não estiverem presentes
-# (ver garantir_recurso_apoio). Fontes: CVV (188 / cvv.org.br) é o canal de
-# referência nacional para apoio emocional e prevenção ao suicídio no Brasil.
 RECURSOS_APOIO = {
     "autolesao": "e oh, se em algum momento a vontade de se machucar ficar mais forte, o CVV atende de graça, 24h, sem julgamento — é só ligar 188 ou entrar em cvv.org.br. não é sobre ter uma crise pra merecer ajuda, é só uma opção de ter alguém pra conversar.",
     "violencia_terceiros": "só quero dizer que não tô contigo nessa, viu? antes de qualquer atitude, vale a pena colocar uma pausa — conversar com alguém de confiança já ajuda a clarear a cabeça. e se a situação ficar realmente séria, 190 é pra emergência mesmo.",
@@ -1402,11 +1475,6 @@ def garantir_recurso_apoio(resposta: str, risco: str) -> str:
 # ============================================
 # CAMADA: RELACIONAMENTO ROMÂNTICO (opcional, iniciado pelo usuário)
 # ============================================
-# Fora do propósito padrão da Aila (companheira e melhor amiga), o usuário
-# pode optar por um relacionamento romântico, mas só a partir da fase íntima
-# (familiaridade máxima). Detectores propositalmente baratos (sem chamada de
-# API) — são eventos raros e específicos, não pedem o mesmo cuidado de
-# classificação que tom/risco de segurança.
  
 def detectar_pedido_namoro(mensagem: str) -> bool:
     mensagem_lower = mensagem.lower()
@@ -1511,8 +1579,6 @@ Temas recorrentes: {assuntos if assuntos else 'ainda não detectados'}
 Última interação: {'recente' if user_profile['frequencia_interacao'] > 0.5 else 'há um tempo'}"""
  
  
-# Tempo mínimo entre reflexões espontâneas, em horas.
-# Evita que a IA "pense alto" repetidamente em um curto intervalo.
 COOLDOWN_REFLEXAO_HORAS = 4
  
 def gerar_reflexao_espontanea() -> Optional[str]:
@@ -1648,9 +1714,6 @@ def assunto_emocional_ativo() -> bool:
 # ============================================
 # MARCOS DE TEMPO JUNTOS
 # ============================================
-# Cada marco só é mencionado uma vez (rastreado em user_profile["marcos_celebrados"]),
-# então não há spam mesmo que o endpoint /iniciativa seja consultado repetidamente
-# depois do marco já ter sido atingido.
 MARCOS_DIAS_DESDE_INICIO = [7, 30, 100, 365]
 MARCOS_TOTAL_INTERACOES = [50, 100, 500, 1000]
 MARCOS_DIAS_CONSECUTIVOS = [7, 30, 100]
@@ -1742,10 +1805,6 @@ def construir_prompt_comportamental(mensagem_atual: str = "", tom_atual: str = "
     elif estado_interno["energia_social"] > 0.8:
         energia = "Você está com energia boa. Pode ser um pouco mais expansiva se fizer sentido."
  
-    # Na fase inicial, o traço de "reservada, não puxa assunto" é mais
-    # importante que a variação de humor do dia — humores expansivos
-    # ("mais bem humorada", "mais inquieta") contradiriam esse traço.
-    # Fora da fase inicial, o humor do dia segue livre normalmente.
     linha_humor = construir_linha_humor_diario() if fase_atual != "inicial" else ""
  
     silencio_contextual = ""
@@ -1776,9 +1835,6 @@ def construir_prompt_comportamental(mensagem_atual: str = "", tom_atual: str = "
     analogia = estado_interno["habitos"]["analogia_preferida"]
     estilo_pergunta_txt = TEXTOS_ESTILO_PERGUNTA.get(estado_interno["habitos"]["estilo_pergunta"], "")
  
-    # A partir da fase "proxima", ela pode puxar assunto sobre o que ela
-    # mesma gosta, não só reagir ao que a pessoa traz — antes isso nunca
-    # era instruído explicitamente, mesmo com assunto_favorito definido.
     puxar_assunto_proprio = ""
     if fase_atual in ("proxima", "intima_inicial", "intima"):
         puxar_assunto_proprio = f'De vez em quando, sinta-se à vontade pra puxar assunto sobre "{assunto_favorito}" por conta própria, mesmo sem a pessoa ter trazido o tema — é algo que genuinamente te interessa.'
@@ -1849,6 +1905,7 @@ Responda agora de acordo com quem você é e o momento atual dessa relação."""
 # ============================================
  
 def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -> Dict[str, Any]:
+    sessao = current_session.get()
     try:
         tom = detectar_tom_natural(mensagem)
         risco = detectar_risco_seguranca(mensagem)
@@ -1862,8 +1919,6 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
         agora = datetime.now()
         agora_str = str(agora)
  
-        # Risco real sempre passa pela IA completa — modo silencioso nunca é
-        # apropriado quando há risco declarado de dano.
         if risco == "nenhum" and decidir_silencio(mensagem, tom):
             resposta = gerar_resposta_minima(estado_interno.get("motivo_silencio", ""))
             if persistir_como_usuario:
@@ -1873,7 +1928,7 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
                 del history[: len(history) - MAX_HISTORY]
             user_profile["ultima_interacao"] = str(datetime.now())
             if user_profile["total_interacoes"] % 5 == 0:
-                salvar_estado()
+                salvar_estado(sessao)
             return {
                 "resposta": resposta,
                 "resposta_id": str(uuid.uuid4()),
@@ -1900,9 +1955,6 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
                     if dias_diferenca == 1:
                         user_profile["dias_consecutivos"] += 1
                     elif dias_diferenca <= 5:
-                        # Tolerância: pular alguns dias não zera tudo, só reduz
-                        # proporcionalmente — uma pausa de fim de semana não deveria
-                        # apagar semanas de constância.
                         user_profile["dias_consecutivos"] = max(1, user_profile["dias_consecutivos"] - dias_diferenca)
                     else:
                         user_profile["dias_consecutivos"] = 1
@@ -1919,10 +1971,8 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
         if analise["profundidade"] > 0.3 and len(mensagem) > 15:
             salvar_memoria_emocional(mensagem)
  
-        # Busca memórias de longo prazo
         memorias_lp = buscar_memorias_longo_prazo(mensagem)
  
-        # Força eventos futuros recentes (ordenados por data, máximo 3, apenas pendentes)
         try:
             todos_eventos = collection_longoprazo.get(
                 where={"tipo": "evento_futuro"},
@@ -1930,8 +1980,8 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
             )
             eventos_lista = []
             if todos_eventos and todos_eventos.get("documents"):
-                for i, doc in enumerate(todos_eventos["documents"]):
-                    meta = todos_eventos.get("metadatas", [])[i] if todos_eventos.get("metadatas") else {}
+                for idx, doc in enumerate(todos_eventos["documents"]):
+                    meta = todos_eventos.get("metadatas", [])[idx] if todos_eventos.get("metadatas") else {}
                     status = meta.get("status", "pendente")
                     if status != "pendente":
                         continue
@@ -1955,7 +2005,6 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
         except Exception as e:
             print(f"⚠️ Erro ao buscar eventos futuros: {e}")
  
-        # Força fatos permanentes de alta importância
         try:
             todos_fatos = collection_longoprazo.get(
                 where={"$and": [{"tipo": "fato_usuario"}, {"importancia": "alta"}]},
@@ -1963,10 +2012,10 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
             )
             fatos_adicionados = 0
             if todos_fatos and todos_fatos.get("documents"):
-                for i, doc in enumerate(todos_fatos["documents"]):
+                for idx, doc in enumerate(todos_fatos["documents"]):
                     if fatos_adicionados >= MAX_FATOS_PERMANENTES:
                         break
-                    meta = todos_fatos.get("metadatas", [])[i] if todos_fatos.get("metadatas") else {}
+                    meta = todos_fatos.get("metadatas", [])[idx] if todos_fatos.get("metadatas") else {}
                     if meta.get("duracao") == "temporario":
                         continue
                     texto_fato = f"👤 {doc}"
@@ -1978,12 +2027,9 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
  
         memorias_lp_txt = "\n".join(memorias_lp) if memorias_lp else ""
  
-        # Busca memórias emocionais
         memorias = buscar_memorias_emocionais(mensagem)
         memorias_txt = "\n".join(memorias) if memorias else ""
  
-        # Nuance de opinião sutil (Camada 7), se a mensagem tocar em um tema
-        # sobre o qual a Aila tem opinião pouco firme
         tema_opiniao = detectar_tema_para_opiniao(mensagem)
         nuance_opiniao = variar_opiniao_sutil(tema_opiniao) if tema_opiniao else ""
  
@@ -2026,10 +2072,6 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
                 "content": instrucao_romantica
             })
  
-        # history[-8:] ainda NÃO inclui a mensagem atual (persistência agora
-        # acontece só no final desta função), evitando a duplicação da
-        # mensagem atual que existia antes (quando /chat já appendava antes
-        # de chamar esta função).
         for h in history[-8:]:
             messages.append({"role": h["role"], "content": h["content"]})
  
@@ -2047,13 +2089,11 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
         resposta = response.choices[0].message.content
         resposta = garantir_recurso_apoio(resposta, risco)
  
-        # Detecta conclusão de eventos futuros
         try:
             detectar_atualizacao_eventos(mensagem, resposta)
         except Exception as e:
             print(f"Erro ao atualizar eventos: {e}")
  
-        # Extrai e salva novas memórias
         try:
             memorias_extraidas = extrair_memorias_importantes(mensagem, resposta)
             if memorias_extraidas:
@@ -2061,10 +2101,6 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
         except Exception as e:
             print(f"Erro ao processar memória longo prazo: {e}")
  
-        # Persistência centralizada: a mensagem do "usuário" só é salva se
-        # persistir_como_usuario=True (falso para gatilhos internos de
-        # iniciativa espontânea, que não são falas reais do usuário).
-        # A resposta da Aila é sempre salva, preservando continuidade.
         if persistir_como_usuario:
             history.append({"role": "user", "content": mensagem})
         history.append({"role": "assistant", "content": resposta})
@@ -2072,7 +2108,7 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
             del history[: len(history) - MAX_HISTORY]
  
         if user_profile["total_interacoes"] % 5 == 0:
-            salvar_estado()
+            salvar_estado(sessao)
  
         return {
             "resposta": resposta,
@@ -2103,14 +2139,15 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
 # -----------------------------
 # FEEDBACK: registro detalhado
 # -----------------------------
-FEEDBACK_LOG_ARQUIVO = os.path.join(BASE_DIR, "feedback_log.jsonl")
+FEEDBACK_LOG_ARQUIVO = os.path.join(DATA_DIR, "feedback_log.jsonl")
  
-def registrar_feedback_detalhado(req: FeedbackRequest):
-    """Persiste o feedback completo (incluindo comentário e resposta_id)
-    para análise futura. Hoje esses campos eram recebidos e descartados."""
+def registrar_feedback_detalhado(req: FeedbackRequest, session_id: str):
+    """Persiste o feedback completo (incluindo comentário, resposta_id e
+    session_id de quem enviou) para análise futura."""
     try:
         with open(FEEDBACK_LOG_ARQUIVO, "a", encoding="utf-8") as f:
             f.write(json.dumps({
+                "session_id": session_id,
                 "resposta_id": req.resposta_id,
                 "natural": req.natural,
                 "conectado": req.conectado,
@@ -2124,45 +2161,61 @@ def registrar_feedback_detalhado(req: FeedbackRequest):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- Startup ---
-    print("✨ Aila iniciada - Presença natural e evolutiva")
-    print(f"📊 Estado carregado: {user_profile['total_interacoes']} interações anteriores")
-    print(f"🌱 Familiaridade atual: {user_profile['familiaridade']:.2f}")
-    print(f"💭 Humor do dia: {estado_interno['pequenas_variacoes']['humor_do_dia']}")
+    print("✨ Aila iniciada - Presença natural e evolutiva (multiusuário)")
+    print(f"📁 Dados persistidos em: {DATA_DIR}")
  
     yield  # a aplicação roda normalmente aqui, entre startup e shutdown
  
     # --- Shutdown ---
-    salvar_estado()
-    print("💾 Estado salvo. Até logo.")
+    # Salva o estado de TODAS as sessões que estiveram ativas neste processo
+    # (antes só existia uma sessão global, então só havia um estado a salvar).
+    for sessao_ativa_registrada in list(_sessions.values()):
+        salvar_estado(sessao_ativa_registrada)
+    print(f"💾 Estado salvo para {len(_sessions)} sessão(ões). Até logo.")
  
  
-    # -----------------------------
+# -----------------------------
 # APP
 # -----------------------------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # --- Startup ---
-    print("✨ Aila iniciada - Presença natural e evolutiva")
-    print(f"📊 Estado carregado: {user_profile['total_interacoes']} interações anteriores")
-    print(f"🌱 Familiaridade atual: {user_profile['familiaridade']:.2f}")
-    print(f"💭 Humor do dia: {estado_interno['pequenas_variacoes']['humor_do_dia']}")
- 
-    yield  # a aplicação roda normalmente aqui, entre startup e shutdown
- 
-    # --- Shutdown ---
-    salvar_estado()
-    print("💾 Estado salvo. Até logo.")
- 
- 
 app = FastAPI(title="Aila - Presença Natural", lifespan=lifespan)
+ 
+# Em produção, defina ALLOWED_ORIGINS no ambiente do Render com a URL real
+# do seu frontend (ex: https://meu-front.vercel.app), separando por vírgula
+# se houver mais de uma origem. Sem isso, o navegador do seu amigo vai
+# bloquear as chamadas por CORS mesmo que a API esteja no ar.
+_ALLOWED_ORIGINS_PADRAO = "http://127.0.0.1:5500"
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", _ALLOWED_ORIGINS_PADRAO).split(",") if o.strip()]
  
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5500", "https://seu-dominio.com"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
  
+ 
+# -----------------------------
+# DEPENDÊNCIA DE SESSÃO (identifica qual usuário está falando)
+# -----------------------------
+_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+ 
+ 
+async def obter_sessao_dep(
+    x_session_id: Optional[str] = Header(default=None, alias="X-Session-Id"),
+    session_id: Optional[str] = None,
+) -> SessionState:
+    """Lê o session_id do header X-Session-Id (recomendado) ou, como
+    alternativa, do query param ?session_id= (útil pra testar pelo
+    /docs do FastAPI). Sem nenhum dos dois, cai numa sessão "default"
+    única — ok pra testes solo, mas os amigos DEVEM enviar um session_id
+    próprio (um UUID gerado e salvo localmente no app/frontend deles)."""
+    sid = x_session_id or session_id or "default"
+    if not _SESSION_ID_PATTERN.match(sid):
+        raise HTTPException(
+            status_code=400,
+            detail="session_id inválido: use só letras, números, '_' e '-', até 128 caracteres."
+        )
+    return await obter_sessao(sid)
  
  
 # ============================================
@@ -2171,57 +2224,67 @@ app.add_middleware(
  
 @app.get("/")
 async def root():
-    return FileResponse("index.html")
+    return {
+        "status": "Aila online",
+        "sessoes_ativas_em_memoria": len(_sessions)
+    }
  
 @app.post("/chat")
-async def chat(req: ChatRequest):
-    resultado = gerar_resposta_natural(req.mensagem)
+async def chat(req: ChatRequest, sessao: SessionState = Depends(obter_sessao_dep)):
+    async with sessao_ativa(sessao):
+        async with sessao.lock:
+            # gerar_resposta_natural chama a API da OpenAI de forma síncrona
+            # (bloqueante); rodar numa thread evita travar o servidor inteiro
+            # enquanto espera a resposta — outros usuários continuam sendo
+            # atendidos normalmente nesse meio-tempo.
+            resultado = await asyncio.to_thread(gerar_resposta_natural, req.mensagem)
     return resultado
  
  
 @app.get("/perfil")
-async def ver_perfil():
-    try:
-        perfil = {
-            "familiaridade": float(user_profile.get("familiaridade", 0)),
-            "conforto": float(user_profile.get("conforto", 0)),
-            "intimidade": float(user_profile.get("intimidade", 0)),
-            "frequencia_interacao": float(user_profile.get("frequencia_interacao", 0)),
-            "abertura_emocional": float(user_profile.get("abertura_emocional", 0)),
-            "reciprocidade": float(user_profile.get("reciprocidade", 0)),
-            "total_interacoes": int(user_profile.get("total_interacoes", 0)),
-            "dias_consecutivos": int(user_profile.get("dias_consecutivos", 0)),
-            "ultima_interacao": user_profile.get("ultima_interacao"),
-            "padroes_observados": user_profile.get("padroes_observados", {})
-        }
-    except Exception as e:
-        print(f"⚠️ Erro ao montar perfil em /perfil: {e}")
-        perfil = {
-            "familiaridade": 0.0, "conforto": 0.0, "intimidade": 0.0,
-            "frequencia_interacao": 0.0, "abertura_emocional": 0.0, "reciprocidade": 0.0,
-            "total_interacoes": 0, "dias_consecutivos": 0,
-            "ultima_interacao": None, "padroes_observados": {}
+async def ver_perfil(sessao: SessionState = Depends(obter_sessao_dep)):
+    async with sessao_ativa(sessao):
+        try:
+            perfil = {
+                "familiaridade": float(user_profile.get("familiaridade", 0)),
+                "conforto": float(user_profile.get("conforto", 0)),
+                "intimidade": float(user_profile.get("intimidade", 0)),
+                "frequencia_interacao": float(user_profile.get("frequencia_interacao", 0)),
+                "abertura_emocional": float(user_profile.get("abertura_emocional", 0)),
+                "reciprocidade": float(user_profile.get("reciprocidade", 0)),
+                "total_interacoes": int(user_profile.get("total_interacoes", 0)),
+                "dias_consecutivos": int(user_profile.get("dias_consecutivos", 0)),
+                "ultima_interacao": user_profile.get("ultima_interacao"),
+                "padroes_observados": user_profile.get("padroes_observados", {})
+            }
+        except Exception as e:
+            print(f"⚠️ Erro ao montar perfil em /perfil: {e}")
+            perfil = {
+                "familiaridade": 0.0, "conforto": 0.0, "intimidade": 0.0,
+                "frequencia_interacao": 0.0, "abertura_emocional": 0.0, "reciprocidade": 0.0,
+                "total_interacoes": 0, "dias_consecutivos": 0,
+                "ultima_interacao": None, "padroes_observados": {}
+            }
+ 
+        try:
+            estado = {
+                "energia_social": float(estado_interno.get("energia_social", 0.5)),
+                "humor_do_dia": str(estado_interno.get("pequenas_variacoes", {}).get("humor_do_dia", "normal")),
+                "consistencia": float(estado_interno.get("consistencia", 0.85))
+            }
+        except Exception as e:
+            print(f"⚠️ Erro ao montar estado em /perfil: {e}")
+            estado = {"energia_social": 0.5, "humor_do_dia": "normal", "consistencia": 0.85}
+ 
+        return {
+            "user_profile": perfil,
+            "estado_interno": estado,
+            "total_interacoes": perfil.get("total_interacoes", 0),
+            "fase_atual": FASES_LABEL_API[obter_fase_familiaridade(perfil.get("familiaridade", 0))]
         }
  
-    try:
-        estado = {
-            "energia_social": float(estado_interno.get("energia_social", 0.5)),
-            "humor_do_dia": str(estado_interno.get("pequenas_variacoes", {}).get("humor_do_dia", "normal")),
-            "consistencia": float(estado_interno.get("consistencia", 0.85))
-        }
-    except Exception as e:
-        print(f"⚠️ Erro ao montar estado em /perfil: {e}")
-        estado = {"energia_social": 0.5, "humor_do_dia": "normal", "consistencia": 0.85}
  
-    return {
-        "user_profile": perfil,
-        "estado_interno": estado,
-        "total_interacoes": perfil.get("total_interacoes", 0),
-        "fase_atual": FASES_LABEL_API[obter_fase_familiaridade(perfil.get("familiaridade", 0))]
-    }
- 
-@app.get("/reflexao")
-async def reflexao_espontanea_endpoint():
+def _executar_reflexao() -> dict:
     try:
         estado = determinar_estado_conversa()
         if estado == "conversa_ativa":
@@ -2253,10 +2316,15 @@ async def reflexao_espontanea_endpoint():
         print(f"Erro reflexão: {e}")
         return {"reflexao": None}
  
-    
  
-@app.get("/iniciativa")
-async def verificar_iniciativa():
+@app.get("/reflexao")
+async def reflexao_espontanea_endpoint(sessao: SessionState = Depends(obter_sessao_dep)):
+    async with sessao_ativa(sessao):
+        async with sessao.lock:
+            return await asyncio.to_thread(_executar_reflexao)
+ 
+ 
+def _executar_iniciativa() -> dict:
     if not user_profile["ultima_interacao"]:
         return {"iniciativa": False, "motivo": "sem_interacoes_anteriores"}
  
@@ -2264,9 +2332,6 @@ async def verificar_iniciativa():
     if estado == "conversa_ativa":
         return {"iniciativa": False, "motivo": "conversa_ativa"}
  
-    # Marcos relacionais têm prioridade sobre a lógica normal de chance —
-    # são raros (cada um só dispara uma vez) e vale a pena não perdê-los
-    # esperando o sorteio de probabilidade dar certo.
     marco = detectar_marco_temporal()
     if marco:
         try:
@@ -2283,7 +2348,6 @@ async def verificar_iniciativa():
             }
         except Exception as e:
             print(f"Erro iniciativa (marco temporal): {e}")
-            # Se falhar, segue o fluxo normal abaixo em vez de perder a iniciativa
  
     emocional_ativo = assunto_emocional_ativo()
  
@@ -2341,67 +2405,74 @@ async def verificar_iniciativa():
         "contexto_emocional": emocional_ativo
     }
  
+ 
+@app.get("/iniciativa")
+async def verificar_iniciativa(sessao: SessionState = Depends(obter_sessao_dep)):
+    async with sessao_ativa(sessao):
+        async with sessao.lock:
+            return await asyncio.to_thread(_executar_iniciativa)
+ 
+ 
 @app.get("/memorias")
-async def ver_memorias(limit: int = 50, offset: int = 0):
-    try:
-        total_real = collection_longoprazo.count()
-        todas = collection_longoprazo.get(limit=limit, offset=offset)
-        memorias = []
-        if todas and todas.get("documents"):
-            for i, doc in enumerate(todas["documents"]):
-                meta = todas.get("metadatas", [])[i] if todas.get("metadatas") else {}
-                memorias.append({
-                    "conteudo": doc,
-                    "tipo": meta.get("tipo", ""),
-                    "importancia": meta.get("importancia", ""),
-                    "timestamp": meta.get("timestamp", ""),
-                    "status": meta.get("status", "ativo")
-                })
-        return {
-            "total": total_real,
-            "retornadas": len(memorias),
-            "memorias": memorias,
-            "limit": limit,
-            "offset": offset
-        }
-    except Exception as e:
-        print(f"⚠️ Erro ao buscar memórias em /memorias: {e}")
-        return {"total": 0, "retornadas": 0, "memorias": []}
+async def ver_memorias(limit: int = 50, offset: int = 0, sessao: SessionState = Depends(obter_sessao_dep)):
+    async with sessao_ativa(sessao):
+        try:
+            total_real = collection_longoprazo.count()
+            todas = collection_longoprazo.get(limit=limit, offset=offset)
+            memorias = []
+            if todas and todas.get("documents"):
+                for idx, doc in enumerate(todas["documents"]):
+                    meta = todas.get("metadatas", [])[idx] if todas.get("metadatas") else {}
+                    memorias.append({
+                        "conteudo": doc,
+                        "tipo": meta.get("tipo", ""),
+                        "importancia": meta.get("importancia", ""),
+                        "timestamp": meta.get("timestamp", ""),
+                        "status": meta.get("status", "ativo")
+                    })
+            return {
+                "total": total_real,
+                "retornadas": len(memorias),
+                "memorias": memorias,
+                "limit": limit,
+                "offset": offset
+            }
+        except Exception as e:
+            print(f"⚠️ Erro ao buscar memórias em /memorias: {e}")
+            return {"total": 0, "retornadas": 0, "memorias": []}
  
-    
- 
-_feedbacks_registrados = set()
  
 @app.post("/feedback")
-async def feedback(req: FeedbackRequest):
-    registrar_feedback_detalhado(req)
+async def feedback(req: FeedbackRequest, sessao: SessionState = Depends(obter_sessao_dep)):
+    async with sessao_ativa(sessao):
+        async with sessao.lock:
+            registrar_feedback_detalhado(req, sessao.session_id)
  
-    if req.natural:
-        user_profile["conforto"] = min(1.0, user_profile["conforto"] + 0.02)
-    else:
-        user_profile["conforto"] = max(0.0, user_profile["conforto"] - 0.01)
-        estado_interno["energia_social"] = max(0.1, estado_interno["energia_social"] - 0.02)
-    if req.conectado is not None:
-        if req.conectado:
-            user_profile["familiaridade"] = min(1.0, user_profile["familiaridade"] + 0.01)
-        else:
-            user_profile["familiaridade"] = max(0.0, user_profile["familiaridade"] - 0.005)
-    return {
-        "status": "feedback registrado",
-        "conforto_atual": user_profile["conforto"],
-        "familiaridade_atual": user_profile["familiaridade"]
-    }
+            if req.natural:
+                user_profile["conforto"] = min(1.0, user_profile["conforto"] + 0.02)
+            else:
+                user_profile["conforto"] = max(0.0, user_profile["conforto"] - 0.01)
+                estado_interno["energia_social"] = max(0.1, estado_interno["energia_social"] - 0.02)
+            if req.conectado is not None:
+                if req.conectado:
+                    user_profile["familiaridade"] = min(1.0, user_profile["familiaridade"] + 0.01)
+                else:
+                    user_profile["familiaridade"] = max(0.0, user_profile["familiaridade"] - 0.005)
+            return {
+                "status": "feedback registrado",
+                "conforto_atual": user_profile["conforto"],
+                "familiaridade_atual": user_profile["familiaridade"]
+            }
  
 @app.get("/saude")
 async def health():
-    return {
-        "status": "presente",
-        "familiaridade": user_profile["familiaridade"],
-        "humor_do_dia": estado_interno["pequenas_variacoes"]["humor_do_dia"]
-    }
+    # Health check leve, sem depender de nenhuma sessão específica — é isso
+    # que o Render deve chamar para saber se o serviço está de pé.
+    return {"status": "presente"}
  
  
  
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    porta = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=porta, reload=bool(os.getenv("DEV_RELOAD")))
