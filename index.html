@@ -297,7 +297,27 @@
 </div>
 
 <script>
-const API = "http://127.0.0.1:8000";
+const API = "https://aila-companion.onrender.com";
+
+// ============================================
+// IDENTIDADE DA SESSÃO (um por navegador/pessoa)
+// ============================================
+// O backend isola histórico/personalidade por usuário através deste header.
+// Sem ele, todo mundo que abrir esta página cai na mesma sessão "default"
+// e volta a compartilhar uma única Aila.
+function obterSessionId() {
+  let id = localStorage.getItem("aila_session_id");
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem("aila_session_id", id);
+  }
+  return id;
+}
+const SESSION_ID = obterSessionId();
+const HEADERS_SESSAO = {
+  "Content-Type": "application/json",
+  "X-Session-Id": SESSION_ID,
+};
 
 // ============================================
 // HISTÓRICO LOCAL
@@ -338,22 +358,25 @@ function criarElementoMensagem(msg) {
   div.appendChild(textoNode);
 
   if (msg.tipo === "ia" && msg.respostaId) {
-    const feedback = document.createElement("div");
-    feedback.className = "feedback-area";
+    // Nome trocado para "areaFeedback" — antes se chamava "feedback", igual
+    // à função enviarFeedback() abaixo, e isso fazia os botões quebrarem
+    // silenciosamente ao clicar (a variável local escondia a função).
+    const areaFeedback = document.createElement("div");
+    areaFeedback.className = "feedback-area";
 
     const naturalBtn = document.createElement("button");
     naturalBtn.className = "feedback-btn";
     naturalBtn.textContent = "natural";
-    naturalBtn.onclick = () => feedback(msg.respostaId, true);
+    naturalBtn.onclick = () => enviarFeedback(msg.respostaId, true);
 
     const estranhoBtn = document.createElement("button");
     estranhoBtn.className = "feedback-btn";
     estranhoBtn.textContent = "estranho";
-    estranhoBtn.onclick = () => feedback(msg.respostaId, false);
+    estranhoBtn.onclick = () => enviarFeedback(msg.respostaId, false);
 
-    feedback.appendChild(naturalBtn);
-    feedback.appendChild(estranhoBtn);
-    div.appendChild(feedback);
+    areaFeedback.appendChild(naturalBtn);
+    areaFeedback.appendChild(estranhoBtn);
+    div.appendChild(areaFeedback);
   }
 
   return div;
@@ -463,7 +486,7 @@ async function enviar() {
   try {
     const res = await fetch(API + "/chat", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: HEADERS_SESSAO,
       body: JSON.stringify({ mensagem: texto })
     });
 
@@ -491,11 +514,11 @@ async function enviar() {
 // ============================================
 // FEEDBACK
 // ============================================
-async function feedback(respostaId, natural) {
+async function enviarFeedback(respostaId, natural) {
   try {
     await fetch(API + "/feedback", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: HEADERS_SESSAO,
       body: JSON.stringify({
         resposta_id: respostaId,
         natural: natural,
@@ -513,7 +536,7 @@ setInterval(async () => {
   atualizandoPainel = true;
 
   try {
-    const res = await fetch(API + "/perfil");
+    const res = await fetch(API + "/perfil", { headers: HEADERS_SESSAO });
     if (!res.ok) return;
 
     const data = await res.json();
@@ -540,7 +563,7 @@ setInterval(async () => {
   verificandoReflexao = true;
 
   try {
-    const res = await fetch(API + "/reflexao");
+    const res = await fetch(API + "/reflexao", { headers: HEADERS_SESSAO });
     if (!res.ok) return;
 
     const data = await res.json();
@@ -569,7 +592,7 @@ setInterval(async () => {
   verificandoIniciativa = true;
 
   try {
-    const res = await fetch(API + "/iniciativa");
+    const res = await fetch(API + "/iniciativa", { headers: HEADERS_SESSAO });
     if (!res.ok) return;
 
     const data = await res.json();
