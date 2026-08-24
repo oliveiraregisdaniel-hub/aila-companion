@@ -730,17 +730,42 @@ def detectar_atualizacao_eventos(mensagem: str, resposta_ia: str):
         if not eventos_pendentes or not eventos_pendentes.get("documents"):
             return
  
+        agora = datetime.now()
+ 
+        eventos_com_data = []
+        metadatas_pendentes = eventos_pendentes.get("metadatas") or []
+        for idx, doc in enumerate(eventos_pendentes.get("documents", [])):
+            meta = metadatas_pendentes[idx] if idx < len(metadatas_pendentes) else {}
+            timestamp = meta.get("timestamp", "")
+            descricao_data = "data de criação desconhecida"
+            try:
+                data_criacao = datetime.fromisoformat(timestamp)
+                dias_desde_criacao = (agora - data_criacao).days
+                if dias_desde_criacao == 0:
+                    descricao_data = "criado hoje"
+                elif dias_desde_criacao == 1:
+                    descricao_data = "criado ontem"
+                else:
+                    descricao_data = f"criado há {dias_desde_criacao} dias"
+            except Exception:
+                pass
+            eventos_com_data.append(f'- "{doc}" ({descricao_data})')
+        eventos_txt = "\n".join(eventos_com_data)
+ 
         prompt_deteccao = f"""Analise se esta mensagem indica que algum evento foi concluído ou atualizado.
+ 
+Data e hora atuais: {DIAS_SEMANA_PT[agora.weekday()]}, {agora.strftime('%d/%m/%Y')}, {agora.strftime('%H:%M')}.
  
 Mensagem do usuário: "{mensagem}"
 Resposta da IA: "{resposta_ia}"
  
-Eventos pendentes:
-{json.dumps(eventos_pendentes.get('documents', []), ensure_ascii=False)}
+Eventos pendentes (com quando foram criados, para você calcular se "ontem", "hoje de manhã" etc. fazem sentido):
+{eventos_txt}
  
 Regras:
 - Se o usuário indica que fez algo que estava planejado, marque como "concluido"
 - Se o usuário cancelou ou adiou, marque como "cancelado"
+- Use a data atual e a data de criação de cada evento para interpretar corretamente expressões relativas de tempo ("ontem", "hoje", "essa manhã")
 - Se não houver relação com os eventos, retorne lista vazia
  
 Retorne um JSON no formato {{"atualizacoes": [{{"evento": "Vai assistir Mushishi", "novo_status": "concluido"}}]}}.
@@ -1284,7 +1309,12 @@ def decidir_silencio(mensagem: str, tom: str) -> bool:
     elif user_profile["familiaridade"] > 0.7 and "obrigado" in mensagem.lower() and len(mensagem) < 15:
         silenciar = True
         motivo = "agradecimento curto, familiaridade alta — não precisa reagir"
-    elif tom == "reflexivo" and "?" not in mensagem:
+    elif (
+        tom == "reflexivo"
+        and "?" not in mensagem
+        and len(mensagem) > 30
+        and obter_fase_familiaridade(user_profile["familiaridade"]) in ("intima_inicial", "intima")
+    ):
         silenciar = True
         motivo = "reflexão sem pergunta — espaço para pensar"
  
@@ -1901,6 +1931,43 @@ Responda agora de acordo com quem você é e o momento atual dessa relação."""
     return prompt
  
 # ============================================
+# CONTEXTO TEMPORAL
+# ============================================
+# Sem isso, o modelo nunca sabe que dia/hora é "agora" — ele só infere pelo
+# texto da conversa, e por isso pode ficar "preso" num dia da semana ou achar
+# que um evento de "amanhã" ainda não aconteceu mesmo depois de já ter passado.
+ 
+DIAS_SEMANA_PT = [
+    "segunda-feira", "terça-feira", "quarta-feira", "quinta-feira",
+    "sexta-feira", "sábado", "domingo"
+]
+ 
+ 
+def construir_contexto_temporal(ultima_interacao_anterior: Optional[str] = None) -> str:
+    """Monta a linha de contexto temporal enviada ao modelo. Recebe o
+    timestamp da ÚLTIMA interação ANTES de ser sobrescrito pela interação
+    atual (gerar_resposta_natural já atualiza user_profile["ultima_interacao"]
+    para "agora" antes do prompt ser montado, então ler direto de lá aqui
+    sempre daria uma diferença de ~0 horas)."""
+    agora = datetime.now()
+    linha = f"Agora é {DIAS_SEMANA_PT[agora.weekday()]}, {agora.strftime('%d/%m/%Y')}, {agora.strftime('%H:%M')}."
+ 
+    if ultima_interacao_anterior:
+        try:
+            ultima = datetime.fromisoformat(ultima_interacao_anterior)
+            horas = (agora - ultima).total_seconds() / 3600
+            if horas >= 20:
+                dias = round(horas / 24)
+                linha += f" A última vez que vocês conversaram foi há {dias} dia(s)."
+            elif horas >= 2:
+                linha += f" A última vez que vocês conversaram foi há cerca de {horas:.0f} hora(s)."
+        except Exception as e:
+            print(f"⚠️ ultima_interacao inválida em construir_contexto_temporal: {e}")
+ 
+    return linha
+ 
+ 
+# ============================================
 # RESPOSTA PRINCIPAL
 # ============================================
  
@@ -1943,6 +2010,8 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
  
         if user_profile["primeira_interacao"] is None:
             user_profile["primeira_interacao"] = agora_str
+ 
+        ultima_interacao_anterior = user_profile["ultima_interacao"]
  
         if user_profile["ultima_interacao"]:
             try:
@@ -2036,6 +2105,7 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
         prompt_comportamental = construir_prompt_comportamental(mensagem, tom)
  
         messages = [{"role": "system", "content": prompt_comportamental}]
+        messages.append({"role": "system", "content": construir_contexto_temporal(ultima_interacao_anterior)})
  
         if memorias_lp_txt:
             messages.append({
