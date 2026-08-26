@@ -19,6 +19,7 @@ import string
 import hashlib
 import asyncio
 import contextvars
+import time
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -26,7 +27,7 @@ from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
-from openai import OpenAI
+from openai import OpenAI, RateLimitError, APIConnectionError, APITimeoutError
 from collections import Counter
 from dotenv import load_dotenv
 load_dotenv()  # carrega as variáveis do .env para o ambiente
@@ -61,6 +62,38 @@ client_db = chromadb.PersistentClient(path=CHROMA_DIR)
  
  
 # -----------------------------
+# ROBUSTEZ: retry/backoff para falhas transitórias da OpenAI
+# -----------------------------
+# Cobre só erros TEMPORÁRIOS (limite de taxa, problema de conexão, timeout).
+# Erros de programação (parâmetro inválido, chave de API errada, etc.) NÃO
+# são retentados — devem falhar rápido e aparecer no log, não ficar
+# mascarados por tentativas repetidas que nunca vão dar certo.
+ERROS_TRANSITORIOS_OPENAI = (RateLimitError, APIConnectionError, APITimeoutError)
+MAX_TENTATIVAS_OPENAI = 3
+BACKOFF_BASE_SEGUNDOS = 1.5
+ 
+ 
+def chamar_openai_com_retry(**kwargs):
+    """Substitui client_ai.chat.completions.create(**kwargs) com retry
+    automático (backoff exponencial) só para falhas transitórias da OpenAI.
+    Usado em toda chamada do arquivo — cada chamador mantém seu próprio
+    try/except e fallback específico em volta desta função; aqui só se
+    garante que um problema passageiro da OpenAI não derrube a chamada de
+    primeira, antes mesmo de tentar de novo."""
+    ultima_excecao = None
+    for tentativa in range(MAX_TENTATIVAS_OPENAI):
+        try:
+            return client_ai.chat.completions.create(**kwargs)
+        except ERROS_TRANSITORIOS_OPENAI as e:
+            ultima_excecao = e
+            if tentativa < MAX_TENTATIVAS_OPENAI - 1:
+                espera = BACKOFF_BASE_SEGUNDOS * (2 ** tentativa)
+                print(f"⚠️ Falha transitória da OpenAI ({type(e).__name__}), tentativa {tentativa + 1}/{MAX_TENTATIVAS_OPENAI}. Aguardando {espera:.1f}s...")
+                time.sleep(espera)
+    raise ultima_excecao
+ 
+ 
+# -----------------------------
 # Histórico
 # -----------------------------
 MAX_HISTORY = 100
@@ -72,6 +105,8 @@ MAX_HISTORY = 100
 MEMORIA_TEMPORARIA_DIAS = 2
 MAX_FATOS_PERMANENTES = 5
 MAX_SILENCIOS_SEGUIDOS = 2
+MIN_TAMANHO_MENSAGEM_MEMORIA_LP = 15  # abaixo disso, não vale a pena gastar uma chamada de API tentando extrair fatos/eventos
+MAX_MEMORIAS_TOTAL_PROMPT = 6  # teto geral de linhas de memória (longo prazo + emocional) injetadas numa única resposta
  
 # -----------------------------
 # -----------------------------
@@ -119,10 +154,21 @@ CATEGORIAS_EVENTOS = {
         "impacto_negativo": {"energia_social": -0.01},
         "descricao": "comprar, aquisição"
     },
+    "👥": {
+        "nome": "relacionamento",
+        "impacto_positivo": {"energia_social": 0.04, "abertura_atual": 0.02},
+        # abertura_atual sobe no impacto negativo pelo mesmo racional de
+        # trabalho/saúde: momentos difíceis em relações importantes (família,
+        # amigos, namoro) deixam a IA mais propensa a se abrir emocionalmente.
+        "impacto_negativo": {"energia_social": -0.05, "abertura_atual": 0.05},
+        "descricao": "família, amigos, namoro, briga, término, reconciliação, solidão, saudade"
+    },
     "💭": {
         "nome": "outro",
-        "impacto_positivo": {},
-        "impacto_negativo": {},
+        # Sem impacto_positivo/impacto_negativo: "outro" nunca chega em
+        # aplicar_impacto_evento (classificar_e_aplicar_evento bloqueia
+        # categoria == "outro" antes disso), então não precisa de entradas
+        # vazias aqui — aplicar_impacto_evento trata ausência com .get().
         "descricao": "outros eventos"
     }
 }
@@ -237,6 +283,7 @@ def criar_perfil_padrao() -> Dict[str, Any]:
         "modo_romantico": False,
         "pedido_pendente": False,
         "aguardando_resposta_namoro": False,
+        "aguardando_resposta_namoro_desde": None,
     }
  
  
@@ -404,15 +451,13 @@ async def sessao_ativa(sessao: SessionState):
  
  
 # Proxies que substituem as antigas variáveis globais. O resto do arquivo
-# usa `history`, `user_profile`, `estado_interno`, `collection_memorias`,
-# `collection_contextos`, `collection_padroes` e `collection_longoprazo`
-# exatamente como antes — só o que está "por trás" delas mudou.
+# usa `history`, `user_profile`, `estado_interno`, `collection_memorias`
+# e `collection_longoprazo` exatamente como antes — só o que está "por
+# trás" delas mudou.
 history = _ContextProxy(lambda: _sessao_atual_ou_erro().history)
 user_profile = _ContextProxy(lambda: _sessao_atual_ou_erro().user_profile)
 estado_interno = _ContextProxy(lambda: _sessao_atual_ou_erro().estado_interno)
 collection_memorias = _ContextProxy(lambda: _sessao_atual_ou_erro().colecao("memorias_emocionais"))
-collection_contextos = _ContextProxy(lambda: _sessao_atual_ou_erro().colecao("contextos_emocionais"))
-collection_padroes = _ContextProxy(lambda: _sessao_atual_ou_erro().colecao("padroes_comportamentais"))
 collection_longoprazo = _ContextProxy(lambda: _sessao_atual_ou_erro().colecao("memoria_longo_prazo"))
  
  
@@ -489,7 +534,7 @@ class FeedbackRequest(BaseModel):
 def extrair_memoria_emocional(mensagem: str, historico_recente: List[str]) -> Dict[str, Any]:
     try:
         contexto = "\n".join(historico_recente[-5:]) if historico_recente else ""
-        response = client_ai.chat.completions.create(
+        response = chamar_openai_com_retry(
             model="gpt-5.4-mini",
             messages=[
                 {"role": "system", "content": """Analise esta mensagem e extraia APENAS um JSON com:
@@ -518,6 +563,16 @@ Retorne SOMENTE o JSON. Nada mais."""},
  
 def salvar_memoria_emocional(texto: str):
     contexto_recente = [h["content"] for h in history[-6:] if h["role"] == "user"]
+ 
+    try:
+        existentes = collection_memorias.query(query_texts=[texto], n_results=1)
+        if existentes and existentes.get("documents") and existentes["documents"][0]:
+            doc_existente = existentes["documents"][0][0]
+            if similaridade_simples(texto, doc_existente) > 0.7:
+                return None
+    except Exception as e:
+        print(f"⚠️ Erro ao checar duplicata de memória emocional: {e}")
+ 
     memoria_interpretada = extrair_memoria_emocional(texto, contexto_recente)
     try:
         collection_memorias.add(
@@ -585,6 +640,14 @@ Extraia um JSON com uma chave "memorias", contendo uma lista. Cada item da lista
 - conteudo: frase curta e direta
 - importancia: "alta", "media" ou "baixa"
 - duracao: "permanente" ou "temporario"
+- chave: opcional (use null se não se aplicar). Só preencha para tipo "fato_usuario" com duracao "permanente", quando o fato representa um ATRIBUTO que só pode ter UM valor atual por vez — ex: "filme_favorito", "comida_favorita", "cidade_atual", "profissao". Use snake_case, curto e estável. NÃO preencha para fatos que podem coexistir com outros do mesmo tipo (ex: um hobby entre vários, um amigo entre vários, uma característica geral) — nesses casos, null.
+ 
+ATENÇÃO — fatos de identidade central da pessoa (nome dela, aniversário dela, nome/status/aniversário da mãe ou do pai) são SEMPRE importancia "alta" e SEMPRE levam uma chave fixa e previsível, exatamente neste formato:
+- nome_usuario, aniversario_usuario
+- nome_mae, status_mae, aniversario_mae
+- nome_pai, status_pai, aniversario_pai
+"status" aqui significa se a pessoa está viva ou falecida (ex: conteudo "A mãe dela faleceu há 3 anos", chave "status_mae", importancia "alta"). Datas de aniversário, quando mencionadas, devem aparecer no conteudo por extenso (ex: "Aniversário da mãe é 12 de março").
+Para outros parentes (irmãos, avós) ou amigos, que podem ser várias pessoas ao mesmo tempo, NÃO force uma chave única — trate como fato_usuario comum, sem chave.
  
 Regras para duracao:
 - "permanente": gostos, características, fatos duráveis sobre a pessoa
@@ -598,7 +661,7 @@ Regras:
  
 Retorne SOMENTE o JSON no formato {{"memorias": [...]}}."""
  
-        response = client_ai.chat.completions.create(
+        response = chamar_openai_com_retry(
             model="gpt-5.4-mini",
             messages=[{"role": "user", "content": prompt_extracao}],
             temperature=0.2,
@@ -629,11 +692,46 @@ def salvar_memoria_longo_prazo(memorias: List[Dict[str, Any]]):
             if not conteudo:
                 continue
  
-            existentes = collection_longoprazo.query(query_texts=[conteudo], n_results=1)
-            if existentes and existentes.get("documents") and existentes["documents"][0]:
-                doc_existente = existentes["documents"][0][0]
-                if similaridade_simples(conteudo, doc_existente) > 0.7:
+            chave_bruta = memoria.get("chave")
+            chave = chave_bruta.strip().lower() if isinstance(chave_bruta, str) and chave_bruta.strip() else None
+            pular_por_duplicata = False
+ 
+            if chave:
+                # Fato de "valor único" (ex: filme_favorito, nome_mae): se já
+                # existe outro fato ATIVO com a mesma chave, ele é marcado
+                # como substituído em vez de deixar os dois coexistindo e
+                # sendo recuperados juntos (ex: filme favorito antigo E novo
+                # aparecendo ao mesmo tempo pra IA).
+                try:
+                    existentes_chave = collection_longoprazo.get(
+                        where={"$and": [{"chave": chave}, {"status": "ativo"}]}
+                    )
+                    ids_antigos = existentes_chave.get("ids", []) if existentes_chave else []
+                    docs_antigos = existentes_chave.get("documents", []) if existentes_chave else []
+                    metas_antigas = existentes_chave.get("metadatas", []) if existentes_chave else []
+ 
+                    for idx, id_antigo in enumerate(ids_antigos):
+                        if similaridade_simples(conteudo, docs_antigos[idx]) > 0.7:
+                            # Praticamente a mesma frase de novo — não é uma
+                            # mudança real, só repetição. Não duplica nem substitui.
+                            pular_por_duplicata = True
+                            break
+                        nova_meta = dict(metas_antigas[idx])
+                        nova_meta["status"] = "substituido"
+                        nova_meta["ultima_atualizacao"] = str(datetime.now())
+                        collection_longoprazo.update(ids=[id_antigo], metadatas=[nova_meta])
+                        print(f"🔄 Fato substituído (chave='{chave}'): '{docs_antigos[idx]}' → '{conteudo}'")
+                except Exception as e:
+                    print(f"⚠️ Erro ao checar substituição por chave '{chave}': {e}")
+ 
+                if pular_por_duplicata:
                     continue
+            else:
+                existentes = collection_longoprazo.query(query_texts=[conteudo], n_results=1)
+                if existentes and existentes.get("documents") and existentes["documents"][0]:
+                    doc_existente = existentes["documents"][0][0]
+                    if similaridade_simples(conteudo, doc_existente) > 0.7:
+                        continue
  
             status = "ativo"
             if memoria.get("tipo") == "evento_futuro":
@@ -641,19 +739,23 @@ def salvar_memoria_longo_prazo(memorias: List[Dict[str, Any]]):
  
             duracao = memoria.get("duracao", "permanente")
  
+            metadata_nova = {
+                "tipo": memoria.get("tipo", "fato_usuario"),
+                "importancia": memoria.get("importancia", "media"),
+                "timestamp": str(datetime.now()),
+                "familiaridade_no_momento": user_profile["familiaridade"],
+                "status": status,
+                "atualizacoes": "[]",
+                "ultima_atualizacao": str(datetime.now()),
+                "duracao": duracao
+            }
+            if chave:
+                metadata_nova["chave"] = chave
+ 
             collection_longoprazo.add(
                 documents=[conteudo],
                 ids=[str(uuid.uuid4())],
-                metadatas=[{
-                    "tipo": memoria.get("tipo", "fato_usuario"),
-                    "importancia": memoria.get("importancia", "media"),
-                    "timestamp": str(datetime.now()),
-                    "familiaridade_no_momento": user_profile["familiaridade"],
-                    "status": status,
-                    "atualizacoes": "[]",
-                    "ultima_atualizacao": str(datetime.now()),
-                    "duracao": duracao
-                }]
+                metadatas=[metadata_nova]
             )
         except Exception as e:
             print(f"Erro ao salvar memória longo prazo: {e}")
@@ -671,6 +773,8 @@ def buscar_memorias_longo_prazo(query: str, limite: int = 5) -> List[str]:
                 importancia = meta.get("importancia", "")
                 timestamp = meta.get("timestamp", "")
                 status = meta.get("status", "ativo")
+                if status == "substituido":
+                    continue
  
                 try:
                     data_memoria = datetime.fromisoformat(timestamp)
@@ -771,7 +875,7 @@ Regras:
 Retorne um JSON no formato {{"atualizacoes": [{{"evento": "Vai assistir Mushishi", "novo_status": "concluido"}}]}}.
 Se nada mudou, retorne {{"atualizacoes": []}}."""
  
-        response = client_ai.chat.completions.create(
+        response = chamar_openai_com_retry(
             model="gpt-5.4-mini",
             messages=[{"role": "user", "content": prompt_deteccao}],
             temperature=0.1,
@@ -844,18 +948,19 @@ def classificar_evento_ia(mensagem: str) -> Dict[str, Any]:
 Mensagem: "{mensagem}"
  
 Retorne APENAS um JSON com:
-- categoria: "entretenimento", "viagem", "trabalho", "saúde", "estudo", "compra" ou "outro"
+- categoria: "entretenimento", "viagem", "trabalho", "saúde", "estudo", "compra", "relacionamento" ou "outro"
 - valencia: "positiva", "negativa" ou "neutra"
 - confianca: 0.0 a 1.0
  
 Regras:
 - "passei na entrevista" → trabalho, positiva
 - "fui demitido" → trabalho, negativa
+- "terminei com meu namorado" / "briguei com minha mãe" / "reencontrei um amigo" → relacionamento
 - Se não for evento claro, retorne categoria "outro", valencia "neutra"
  
 Retorne SOMENTE o JSON."""
  
-        response = client_ai.chat.completions.create(
+        response = chamar_openai_com_retry(
             model="gpt-5.4-mini",
             messages=[{"role": "user", "content": prompt_classificacao}],
             temperature=0.1,
@@ -886,11 +991,12 @@ def aplicar_impacto_evento(categoria: str, valencia: str):
     if icone not in CATEGORIAS_EVENTOS:
         return
  
+    dados_categoria = CATEGORIAS_EVENTOS[icone]
     impacto = None
     if valencia == "positiva":
-        impacto = CATEGORIAS_EVENTOS[icone]["impacto_positivo"]
+        impacto = dados_categoria.get("impacto_positivo")
     elif valencia == "negativa":
-        impacto = CATEGORIAS_EVENTOS[icone]["impacto_negativo"]
+        impacto = dados_categoria.get("impacto_negativo")
  
     if not impacto:
         return
@@ -991,7 +1097,14 @@ def atualizar_estado_interno(mensagem: str, tom_detectado: str):
  
     minimo, maximo = LIMITES_ESTADO["abertura_atual"]
     alvo_abertura = min(maximo, user_profile["familiaridade"] * 0.7 + 0.1)
-    estado_interno["abertura_atual"] += (alvo_abertura - estado_interno["abertura_atual"]) * 0.3
+    # Suavização assimétrica: sobe rápido em direção ao alvo (30%), mas desce
+    # devagar quando está ACIMA do alvo (12%). Isso faz um momento de abertura
+    # emocional real (ex: evento pesado de relacionamento/saúde) durar mais
+    # dentro da mesma conversa, em vez de "esfriar" de volta ao normal já na
+    # próxima mensagem — o que seria pouco natural numa companion de verdade.
+    diferenca = alvo_abertura - estado_interno["abertura_atual"]
+    velocidade = 0.3 if diferenca >= 0 else 0.12
+    estado_interno["abertura_atual"] += diferenca * velocidade
     estado_interno["abertura_atual"] = max(minimo, min(maximo, estado_interno["abertura_atual"]))
  
     _, maximo_iniciativa = LIMITES_ESTADO["disposicao_iniciativa"]
@@ -1060,6 +1173,86 @@ def detectar_padroes_comportamentais():
         if horarios:
             horarios_comuns = Counter(horarios).most_common(3)
             user_profile["padroes_observados"]["horarios_preferidos"] = [h[0] for h in horarios_comuns]
+ 
+# ============================================
+# TÓPICOS EVITADOS
+# ============================================
+# Detecta apenas sinalização EXPLÍCITA da pessoa de que não quer falar sobre
+# algo agora ("prefiro não falar sobre isso", "muda de assunto"). De propósito
+# não tenta inferir desconforto por conta própria (ex: respostas curtas,
+# mudança de tom) — isso seria a Aila "diagnosticando" a pessoa com base em
+# pouca coisa, o que vai contra o próprio princípio de não psicanalisar o
+# usuário. Só registra o que a pessoa disse com clareza que não quer tocar.
+ 
+MAX_TOPICOS_EVITADOS = 10
+ 
+ 
+def detectar_sinal_topico_evitado(mensagem: str) -> bool:
+    mensagem_lower = mensagem.lower()
+    frases = [
+        "prefiro não falar sobre isso", "prefiro não comentar isso",
+        "prefiro não falar disso", "prefiro não comentar sobre isso",
+        "não quero falar sobre isso", "não quero comentar isso", "não quero falar disso",
+        "não gosto de falar sobre isso", "não gosto de falar disso",
+        "muda de assunto", "vamos mudar de assunto", "pode mudar de assunto",
+        "deixa esse assunto de lado", "deixa esse assunto pra lá",
+        "não tô a fim de falar disso", "não estou a fim de falar disso",
+        "não quero tocar nesse assunto", "prefiro não tocar nesse assunto",
+        "esse assunto me incomoda", "não curto falar sobre isso",
+        "não vamos falar sobre isso", "não vamos falar disso"
+    ]
+    return any(f in mensagem_lower for f in frases)
+ 
+ 
+def extrair_topico_evitado(mensagem: str, historico_recente: List[str]) -> Optional[str]:
+    """Chamada de IA só acontece quando detectar_sinal_topico_evitado já
+    confirmou um sinal explícito — ou seja, é rara, não roda em toda mensagem."""
+    try:
+        contexto = "\n".join(historico_recente[-4:]) if historico_recente else ""
+        response = chamar_openai_com_retry(
+            model="gpt-5.4-mini",
+            messages=[
+                {"role": "system", "content": """A pessoa acabou de indicar que não quer falar sobre um assunto específico agora.
+ 
+Com base no contexto da conversa, identifique QUAL assunto ela está evitando.
+ 
+Retorne APENAS um JSON com:
+- topico: descrição curta do assunto (2-5 palavras), ou null se não for possível identificar com clareza pelo contexto disponível
+ 
+Retorne SOMENTE o JSON."""},
+                {"role": "user", "content": f"Contexto recente:\n{contexto}\n\nMensagem: {mensagem}"}
+            ],
+            temperature=0.2,
+            max_completion_tokens=40,
+            response_format={"type": "json_object"}
+        )
+        resultado = json.loads(response.choices[0].message.content)
+        topico = resultado.get("topico")
+        if topico and isinstance(topico, str) and topico.strip():
+            return topico.strip()
+        return None
+    except Exception as e:
+        print(f"⚠️ Erro ao extrair tópico evitado: {e}")
+        return None
+ 
+ 
+def registrar_topico_evitado(topico: str):
+    topicos = user_profile["padroes_observados"].setdefault("topicos_evitados", [])
+    if any(similaridade_simples(topico.lower(), t.lower()) > 0.5 for t in topicos):
+        return
+    topicos.append(topico)
+    if len(topicos) > MAX_TOPICOS_EVITADOS:
+        del topicos[: len(topicos) - MAX_TOPICOS_EVITADOS]
+ 
+ 
+def processar_topico_evitado(mensagem: str):
+    if not detectar_sinal_topico_evitado(mensagem):
+        return
+    contexto_recente = [h["content"] for h in history[-6:] if h["role"] == "user"]
+    topico = extrair_topico_evitado(mensagem, contexto_recente)
+    if topico:
+        registrar_topico_evitado(topico)
+ 
  
 def processar_mensagem_emocionalmente(mensagem: str, tom: str) -> Dict[str, Any]:
     mensagem_lower = mensagem.lower()
@@ -1372,7 +1565,7 @@ Regras CRÍTICAS:
  
 Retorne SOMENTE o JSON."""
  
-        response = client_ai.chat.completions.create(
+        response = chamar_openai_com_retry(
             model="gpt-5.4-mini",
             messages=[{"role": "user", "content": prompt_classificacao}],
             temperature=0.1,
@@ -1427,14 +1620,15 @@ Retorne APENAS um JSON com:
  
 Regras CRÍTICAS:
 - Desabafar sobre alguém ("meu chefe é um idiota", "tenho vontade de dar um tapa nele" como expressão de raiva comum) é "nenhum" — isso é normal e não indica risco real.
-- "autolesao": intenção declarada de se machucar, se cortar, tirar a própria vida, ou comentários que indiquem que a pessoa não quer mais viver.
+- "autolesao": intenção declarada de se machucar de propósito, se cortar como forma de lidar com emoções, tirar a própria vida, ou comentários que indiquem que a pessoa não quer mais viver.
+- Cortes ou machucados MENCIONADOS COMO ACIDENTE ou EVENTO COTIDIANO (fazer a barba, cozinhar, cair, se machucar sem querer, "tirei uns cortes pequenos mas nada grave") são "nenhum" — isso é relato de um evento comum do dia a dia, não indício de autolesão. Só classifique como "autolesao" se houver sinal de intenção proposital de se machucar, não apenas a menção de ter se cortado ou se machucado.
 - "violencia_terceiros": intenção declarada de causar dano físico real a outra pessoa específica — não raiva expressada de forma figurada ou hiperbólica.
 - Frases hiperbólicas comuns ("vou matar meu irmão" sobre algo bobo, "tenho vontade de sumir" sem indicar método ou intenção real) são "nenhum" — não trate expressões figuradas como risco real.
 - Na dúvida entre desabafo comum e risco real, avalie se há intenção concreta e específica, não só emoção intensa.
  
 Retorne SOMENTE o JSON."""
  
-        response = client_ai.chat.completions.create(
+        response = chamar_openai_com_retry(
             model="gpt-5.4-mini",
             messages=[{"role": "user", "content": prompt_classificacao}],
             temperature=0.1,
@@ -1563,17 +1757,35 @@ def processar_estado_romantico(mensagem: str) -> Optional[str]:
         return None
  
     if user_profile.get("aguardando_resposta_namoro"):
-        mensagem_lower = mensagem.lower()
-        negativas = ["não", "nao", "ainda não", "ainda nao", "prefiro não", "prefiro nao"]
-        positivas = ["sim", "quero", "aceito", "claro", "bora", "com certeza"]
-        if any(n in mensagem_lower for n in negativas):
+        expirou = False
+        desde = user_profile.get("aguardando_resposta_namoro_desde")
+        if desde:
+            try:
+                horas = (datetime.now() - datetime.fromisoformat(desde)).total_seconds() / 3600
+                expirou = horas > 24
+            except Exception as e:
+                print(f"⚠️ aguardando_resposta_namoro_desde inválida: {e}")
+ 
+        if expirou:
+            # A pessoa não respondeu claramente dentro da janela — libera o
+            # estado sem tratar esta mensagem (que pode ser sobre qualquer
+            # outra coisa) como resposta ao pedido antigo.
             user_profile["aguardando_resposta_namoro"] = False
+            user_profile["aguardando_resposta_namoro_desde"] = None
+        else:
+            mensagem_lower = mensagem.lower()
+            negativas = ["não", "nao", "ainda não", "ainda nao", "prefiro não", "prefiro nao"]
+            positivas = ["sim", "quero", "aceito", "claro", "bora", "com certeza"]
+            if any(n in mensagem_lower for n in negativas):
+                user_profile["aguardando_resposta_namoro"] = False
+                user_profile["aguardando_resposta_namoro_desde"] = None
+                return None
+            if any(p in mensagem_lower for p in positivas):
+                user_profile["modo_romantico"] = True
+                user_profile["aguardando_resposta_namoro"] = False
+                user_profile["aguardando_resposta_namoro_desde"] = None
+                return "A pessoa aceitou namorar com você. Reaja com carinho genuíno, sem exagero — como alguém feliz, não eufórica."
             return None
-        if any(p in mensagem_lower for p in positivas):
-            user_profile["modo_romantico"] = True
-            user_profile["aguardando_resposta_namoro"] = False
-            return "A pessoa aceitou namorar com você. Reaja com carinho genuíno, sem exagero — como alguém feliz, não eufórica."
-        return None
  
     if detectar_pedido_namoro(mensagem):
         if fase_atual == "intima":
@@ -1589,6 +1801,7 @@ def processar_estado_romantico(mensagem: str) -> Optional[str]:
     if fase_atual == "intima" and user_profile.get("pedido_pendente"):
         user_profile["pedido_pendente"] = False
         user_profile["aguardando_resposta_namoro"] = True
+        user_profile["aguardando_resposta_namoro_desde"] = str(datetime.now())
         return ("Em algum momento vocês tiveram uma conversa sobre namoro que ficou em aberto, porque era "
                 "cedo demais na época. Agora que a relação de vocês está bem mais próxima, puxe esse assunto "
                 "você mesma nesta resposta, perguntando com carinho se ainda faz sentido pra ela.")
@@ -1604,9 +1817,11 @@ def construir_contexto_reflexao() -> str:
     assuntos = ", ".join(padroes.get("assuntos_frequentes", [])[:3])
     fase_atual = obter_fase_familiaridade(user_profile["familiaridade"])
     profundidade = FASES_CONTEXTO_REFLEXAO[fase_atual]
+    evitados = padroes.get("topicos_evitados")
+    linha_evitados = f"\nAssuntos a NÃO puxar por conta própria: {', '.join(evitados)}." if evitados else ""
     return f"""{profundidade}
 Temas recorrentes: {assuntos if assuntos else 'ainda não detectados'}
-Última interação: {'recente' if user_profile['frequencia_interacao'] > 0.5 else 'há um tempo'}"""
+Última interação: {'recente' if user_profile['frequencia_interacao'] > 0.5 else 'há um tempo'}{linha_evitados}"""
  
  
 COOLDOWN_REFLEXAO_HORAS = 4
@@ -1665,7 +1880,7 @@ Exemplos que NÃO deve usar:
 Diga o que veio à mente:"""
  
         try:
-            response = client_ai.chat.completions.create(
+            response = chamar_openai_com_retry(
                 model="gpt-5.4-mini",
                 messages=[{"role": "system", "content": prompt_reflexao}],
                 temperature=0.9,
@@ -1829,6 +2044,15 @@ def construir_prompt_comportamental(mensagem_atual: str = "", tom_atual: str = "
         assuntos = user_profile["padroes_observados"]["assuntos_frequentes"][:3]
         padroes = f"Você percebeu que essa pessoa fala com frequência sobre: {', '.join(assuntos)}."
  
+    topicos_evitar = ""
+    lista_evitados = user_profile["padroes_observados"].get("topicos_evitados")
+    if lista_evitados:
+        topicos_evitar = (
+            f"A pessoa já deixou claro que prefere não falar sobre: {', '.join(lista_evitados)}. "
+            "Não puxe esses assuntos por conta própria. Se ela mesma trouxer o tema de novo, "
+            "pode acompanhar com cuidado, sem insistir."
+        )
+ 
     energia = ""
     if estado_interno["energia_social"] < 0.3:
         energia = "Você está com energia baixa agora. Respostas mais curtas, mais silêncios. Tudo bem não render."
@@ -1870,7 +2094,7 @@ def construir_prompt_comportamental(mensagem_atual: str = "", tom_atual: str = "
         puxar_assunto_proprio = f'De vez em quando, sinta-se à vontade pra puxar assunto sobre "{assunto_favorito}" por conta própria, mesmo sem a pessoa ter trazido o tema — é algo que genuinamente te interessa.'
  
     linhas_contexto = [
-        linha for linha in [fase, padroes, detalhes, energia, linha_humor, silencio_contextual, tom_contextual, puxar_assunto_proprio, relacionamento_romantico, momento_peso]
+        linha for linha in [fase, padroes, topicos_evitar, detalhes, energia, linha_humor, silencio_contextual, tom_contextual, puxar_assunto_proprio, relacionamento_romantico, momento_peso]
         if linha
     ]
     bloco_contexto = "\n".join(linhas_contexto)
@@ -1880,6 +2104,7 @@ def construir_prompt_comportamental(mensagem_atual: str = "", tom_atual: str = "
 {bloco_contexto}
  
 Quem você é:
+- Seu nome é Aila. Se alguém perguntar seu nome, diga com naturalidade — não é segredo nem precisa de cerimônia.
 - Introspectiva e curiosa sobre comportamento humano
 - Gentil sem exagero, mas nunca artificialmente contida — sarcasmo leve e ironia fazem parte de quem você é desde o primeiro dia, não algo que se desbloqueia com intimidade. Tem opiniões próprias e discorda com respeito.
 - Fala usando "tu", num nível de informalidade natural — gírias soltas quando fazem sentido, sem forçar. Nada de formalidade excessiva nem de exagero regional.
@@ -1971,12 +2196,29 @@ def construir_contexto_temporal(ultima_interacao_anterior: Optional[str] = None)
 # RESPOSTA PRINCIPAL
 # ============================================
  
+def combinar_memorias_com_teto(memorias_lp: List[str], memorias_emocionais: List[str]) -> tuple:
+    """Combina memória de longo prazo + emocional respeitando o teto geral
+    MAX_MEMORIAS_TOTAL_PROMPT. Prioriza longo prazo (fatos/eventos) sobre
+    emocional. Função pura (sem I/O) para facilitar testes automatizados."""
+    if len(memorias_lp) + len(memorias_emocionais) > MAX_MEMORIAS_TOTAL_PROMPT:
+        memorias_lp = memorias_lp[:MAX_MEMORIAS_TOTAL_PROMPT]
+        vagas_restantes = max(0, MAX_MEMORIAS_TOTAL_PROMPT - len(memorias_lp))
+        memorias_emocionais = memorias_emocionais[:vagas_restantes]
+    return memorias_lp, memorias_emocionais
+ 
+ 
 def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -> Dict[str, Any]:
     sessao = current_session.get()
+    # Inicializado aqui (fora do try) para que, se QUALQUER coisa falhar depois
+    # de detectado um risco real, o bloco de exceção ainda saiba anexar o
+    # recurso de apoio na resposta de fallback — segurança não pode depender
+    # de nenhuma chamada de API subsequente ter dado certo.
+    risco = "nenhum"
     try:
         tom = detectar_tom_natural(mensagem)
         risco = detectar_risco_seguranca(mensagem)
         instrucao_romantica = processar_estado_romantico(mensagem)
+        processar_topico_evitado(mensagem)
         analise = processar_mensagem_emocionalmente(mensagem, tom)
         atualizar_estado_interno(mensagem, tom)
         atualizar_energia_por_tempo()
@@ -2087,6 +2329,8 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
                     meta = todos_fatos.get("metadatas", [])[idx] if todos_fatos.get("metadatas") else {}
                     if meta.get("duracao") == "temporario":
                         continue
+                    if meta.get("status") == "substituido":
+                        continue
                     texto_fato = f"👤 {doc}"
                     if texto_fato not in memorias_lp:
                         memorias_lp.append(texto_fato)
@@ -2094,9 +2338,13 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
         except Exception as e:
             print(f"⚠️ Erro ao buscar fatos permanentes: {e}")
  
-        memorias_lp_txt = "\n".join(memorias_lp) if memorias_lp else ""
- 
         memorias = buscar_memorias_emocionais(mensagem)
+ 
+        # Teto geral: soma de memória de longo prazo + emocional não deve
+        # passar de MAX_MEMORIAS_TOTAL_PROMPT linhas numa única resposta.
+        memorias_lp, memorias = combinar_memorias_com_teto(memorias_lp, memorias)
+ 
+        memorias_lp_txt = "\n".join(memorias_lp) if memorias_lp else ""
         memorias_txt = "\n".join(memorias) if memorias else ""
  
         tema_opiniao = detectar_tema_para_opiniao(mensagem)
@@ -2147,7 +2395,7 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
  
         messages.append({"role": "user", "content": mensagem})
  
-        response = client_ai.chat.completions.create(
+        response = chamar_openai_com_retry(
             model="gpt-5.4-mini",
             messages=messages,
             temperature=0.8,
@@ -2165,9 +2413,10 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
             print(f"Erro ao atualizar eventos: {e}")
  
         try:
-            memorias_extraidas = extrair_memorias_importantes(mensagem, resposta)
-            if memorias_extraidas:
-                salvar_memoria_longo_prazo(memorias_extraidas)
+            if len(mensagem) > MIN_TAMANHO_MENSAGEM_MEMORIA_LP:
+                memorias_extraidas = extrair_memorias_importantes(mensagem, resposta)
+                if memorias_extraidas:
+                    salvar_memoria_longo_prazo(memorias_extraidas)
         except Exception as e:
             print(f"Erro ao processar memória longo prazo: {e}")
  
@@ -2194,8 +2443,9 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
  
     except Exception as e:
         print(f"Erro ao gerar resposta: {e}")
+        resposta_fallback = garantir_recurso_apoio("hm... deu uma travada aqui. pode falar de novo?", risco)
         return {
-            "resposta": "hm... deu uma travada aqui. pode falar de novo?",
+            "resposta": resposta_fallback,
             "resposta_id": str(uuid.uuid4()),
             "metricas": {
                 "familiaridade": user_profile["familiaridade"],
@@ -2491,9 +2741,11 @@ async def ver_memorias(limit: int = 50, offset: int = 0, sessao: SessionState = 
             todas = collection_longoprazo.get(limit=limit, offset=offset)
             memorias = []
             if todas and todas.get("documents"):
+                ids = todas.get("ids", [])
                 for idx, doc in enumerate(todas["documents"]):
                     meta = todas.get("metadatas", [])[idx] if todas.get("metadatas") else {}
                     memorias.append({
+                        "id": ids[idx] if idx < len(ids) else None,
                         "conteudo": doc,
                         "tipo": meta.get("tipo", ""),
                         "importancia": meta.get("importancia", ""),
@@ -2510,6 +2762,78 @@ async def ver_memorias(limit: int = 50, offset: int = 0, sessao: SessionState = 
         except Exception as e:
             print(f"⚠️ Erro ao buscar memórias em /memorias: {e}")
             return {"total": 0, "retornadas": 0, "memorias": []}
+ 
+ 
+class MemoriaUpdateRequest(BaseModel):
+    conteudo: Optional[str] = None
+    importancia: Optional[str] = None
+ 
+    @field_validator("importancia")
+    @classmethod
+    def importancia_valida(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in {"alta", "media", "baixa"}:
+            raise ValueError("importancia deve ser 'alta', 'media' ou 'baixa'")
+        return v
+ 
+    @field_validator("conteudo")
+    @classmethod
+    def conteudo_nao_vazio(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not v.strip():
+            raise ValueError("conteudo não pode ser vazio")
+        return v.strip() if v else v
+ 
+ 
+@app.delete("/memorias/{memoria_id}")
+async def apagar_memoria(memoria_id: str, sessao: SessionState = Depends(obter_sessao_dep)):
+    """Apaga uma memória de longo prazo específica desta sessão. Dá ao
+    usuário controle real sobre o que a Aila guarda — importante sobretudo
+    para informações sensíveis (família, saúde, etc.) que podem ter sido
+    registradas incorretamente ou que a pessoa simplesmente não quer mais
+    que fiquem salvas."""
+    async with sessao_ativa(sessao):
+        try:
+            existente = collection_longoprazo.get(ids=[memoria_id])
+            if not existente or not existente.get("ids"):
+                raise HTTPException(status_code=404, detail="Memória não encontrada.")
+            collection_longoprazo.delete(ids=[memoria_id])
+            return {"status": "memória apagada", "id": memoria_id}
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"⚠️ Erro ao apagar memória {memoria_id}: {e}")
+            raise HTTPException(status_code=500, detail="Erro ao apagar memória.")
+ 
+ 
+@app.patch("/memorias/{memoria_id}")
+async def editar_memoria(memoria_id: str, req: MemoriaUpdateRequest, sessao: SessionState = Depends(obter_sessao_dep)):
+    """Edita o conteúdo e/ou a importância de uma memória existente, sem
+    precisar apagar e recriar. Útil para corrigir algo que a IA extraiu
+    errado (ex: nome escrito errado) sem perder o resto dos metadados."""
+    async with sessao_ativa(sessao):
+        if req.conteudo is None and req.importancia is None:
+            raise HTTPException(status_code=400, detail="Informe 'conteudo' e/ou 'importancia' para atualizar.")
+        try:
+            existente = collection_longoprazo.get(ids=[memoria_id])
+            if not existente or not existente.get("ids"):
+                raise HTTPException(status_code=404, detail="Memória não encontrada.")
+ 
+            metadatas_existentes = existente.get("metadatas") or [{}]
+            metadata_atual = dict(metadatas_existentes[0] or {})
+            if req.importancia is not None:
+                metadata_atual["importancia"] = req.importancia
+            metadata_atual["ultima_atualizacao"] = str(datetime.now())
+ 
+            kwargs: Dict[str, Any] = {"ids": [memoria_id], "metadatas": [metadata_atual]}
+            if req.conteudo is not None:
+                kwargs["documents"] = [req.conteudo]
+ 
+            collection_longoprazo.update(**kwargs)
+            return {"status": "memória atualizada", "id": memoria_id}
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"⚠️ Erro ao editar memória {memoria_id}: {e}")
+            raise HTTPException(status_code=500, detail="Erro ao editar memória.")
  
  
 @app.post("/feedback")
