@@ -107,6 +107,8 @@ MAX_FATOS_PERMANENTES = 5
 MAX_SILENCIOS_SEGUIDOS = 2
 MIN_TAMANHO_MENSAGEM_MEMORIA_LP = 15  # abaixo disso, não vale a pena gastar uma chamada de API tentando extrair fatos/eventos
 MAX_MEMORIAS_TOTAL_PROMPT = 6  # teto geral de linhas de memória (longo prazo + emocional) injetadas numa única resposta
+DIAS_EXPIRAR_PENDENTE = 30  # evento/recomendação/promessa pendente por mais que isso para de ser priorizado e mostrado
+DIAS_MINIMOS_PENDENCIA_ESQUECIDA = 2  # a partir de quantos dias uma recomendação/promessa pendente vira candidata a comentário espontâneo
  
 # -----------------------------
 # -----------------------------
@@ -636,7 +638,7 @@ Mensagem do usuário: "{mensagem}"
 Resposta da IA: "{resposta_ia}"
  
 Extraia um JSON com uma chave "memorias", contendo uma lista. Cada item da lista deve ter:
-- tipo: "fato_usuario", "evento_futuro" ou "historia"
+- tipo: "fato_usuario", "evento_futuro", "historia", "gosto_ia", "recomendacao_ia" ou "promessa_ia"
 - conteudo: frase curta e direta
 - importancia: "alta", "media" ou "baixa"
 - duracao: "permanente" ou "temporario"
@@ -649,8 +651,14 @@ ATENÇÃO — fatos de identidade central da pessoa (nome dela, aniversário del
 "status" aqui significa se a pessoa está viva ou falecida (ex: conteudo "A mãe dela faleceu há 3 anos", chave "status_mae", importancia "alta"). Datas de aniversário, quando mencionadas, devem aparecer no conteudo por extenso (ex: "Aniversário da mãe é 12 de março").
 Para outros parentes (irmãos, avós) ou amigos, que podem ser várias pessoas ao mesmo tempo, NÃO force uma chave única — trate como fato_usuario comum, sem chave.
  
+ATENÇÃO — você (a IA) também pode registrar coisas sobre SI MESMA, quando a resposta da IA declarar algo relevante:
+- "gosto_ia": algo que VOCÊ (a IA) disse que gosta ou não gosta — filme, livro, comida, música, lugar, ou outro tópico concreto. Duracao sempre "permanente". Use chave no formato "<categoria>_ia" (ex: "filme_favorito_ia", "livro_favorito_ia", "comida_favorita_ia", "musica_favorita_ia", "lugar_favorito_ia"). Se o tópico não se encaixar nessas categorias, crie uma chave nova e coerente terminando em "_ia". NUNCA confunda com fato_usuario — isso é sobre a IA, não sobre a pessoa.
+- "recomendacao_ia": algo que VOCÊ recomendou à pessoa (livro, filme, série, música, lugar, etc). NÃO usa chave — várias recomendações podem coexistir ao mesmo tempo.
+- "promessa_ia": algo que VOCÊ disse que faria ou contaria depois (ex: "amanhã eu te conto sobre aquele documentário"). NÃO usa chave.
+Só extraia estes três tipos quando a RESPOSTA DA IA de fato contiver uma declaração desse tipo — não invente.
+ 
 Regras para duracao:
-- "permanente": gostos, características, fatos duráveis sobre a pessoa
+- "permanente": gostos, características, fatos duráveis sobre a pessoa (ou sobre a IA, no caso de "gosto_ia")
 - "temporario": estados passageiros que mudam em dias (ex: "está com frio", "está cansado hoje")
  
 Regras:
@@ -734,7 +742,7 @@ def salvar_memoria_longo_prazo(memorias: List[Dict[str, Any]]):
                         continue
  
             status = "ativo"
-            if memoria.get("tipo") == "evento_futuro":
+            if memoria.get("tipo") in ("evento_futuro", "recomendacao_ia", "promessa_ia"):
                 status = "pendente"
  
             duracao = memoria.get("duracao", "permanente")
@@ -775,6 +783,12 @@ def buscar_memorias_longo_prazo(query: str, limite: int = 5) -> List[str]:
                 status = meta.get("status", "ativo")
                 if status == "substituido":
                     continue
+                # gosto_ia/recomendacao_ia/promessa_ia são sobre a própria
+                # Aila, não sobre a pessoa — ficam de fora deste bloco (que é
+                # apresentado ao modelo como "memórias sobre esta pessoa") e
+                # são buscadas separadamente por buscar_memorias_ia().
+                if tipo in ("gosto_ia", "recomendacao_ia", "promessa_ia"):
+                    continue
  
                 try:
                     data_memoria = datetime.fromisoformat(timestamp)
@@ -785,6 +799,13 @@ def buscar_memorias_longo_prazo(query: str, limite: int = 5) -> List[str]:
  
                 duracao = meta.get("duracao", "permanente")
                 if duracao == "temporario" and dias > MEMORIA_TEMPORARIA_DIAS:
+                    continue
+ 
+                # Evento planejado que nunca foi confirmado nem cancelado por
+                # muito tempo — provavelmente foi esquecido de verdade. Some
+                # dos resultados em vez de continuar ganhando prioridade extra
+                # pra sempre.
+                if status == "pendente" and dias > DIAS_EXPIRAR_PENDENTE:
                     continue
  
                 if status == "concluido":
@@ -823,22 +844,89 @@ def buscar_memorias_longo_prazo(query: str, limite: int = 5) -> List[str]:
         return []
  
  
+TIPOS_MEMORIA_IA = ("gosto_ia", "recomendacao_ia", "promessa_ia")
+ 
+ 
+def buscar_memorias_ia(query: str, limite: int = 3) -> List[str]:
+    """Busca memórias sobre a PRÓPRIA Aila (gostos que ela declarou,
+    recomendações que já fez, promessas que fez) — separado das memórias
+    sobre o usuário para não confundir o modelo sobre de quem é cada
+    informação (o outro bloco é apresentado como "sobre esta pessoa")."""
+    try:
+        resultados = collection_longoprazo.query(
+            query_texts=[query],
+            n_results=limite * 2,
+            where={"tipo": {"$in": list(TIPOS_MEMORIA_IA)}}
+        )
+        memorias = []
+        if resultados and resultados.get("documents"):
+            metadatas = resultados.get("metadatas") or [[]]
+            for i, doc in enumerate(resultados["documents"][0]):
+                meta = metadatas[0][i] if metadatas and metadatas[0] else {}
+                tipo = meta.get("tipo", "")
+                status = meta.get("status", "ativo")
+                if status == "substituido":
+                    continue
+ 
+                try:
+                    dias = (datetime.now() - datetime.fromisoformat(meta.get("timestamp", ""))).days
+                except Exception:
+                    dias = 0
+ 
+                # Recomendação/promessa pendente há muito tempo sem resolução
+                # — provavelmente esquecida de verdade. Some dos resultados
+                # em vez de continuar ganhando prioridade extra pra sempre.
+                if status == "pendente" and dias > DIAS_EXPIRAR_PENDENTE:
+                    continue
+ 
+                if tipo == "gosto_ia":
+                    prefixo = "🎭"
+                elif tipo == "recomendacao_ia":
+                    prefixo = "📚"
+                elif tipo == "promessa_ia":
+                    prefixo = "🤝"
+                else:
+                    prefixo = "💭"
+ 
+                sufixo_status = ""
+                if status == "concluido":
+                    sufixo_status = " [já cumprida/seguida]"
+                elif status == "cancelado":
+                    sufixo_status = " [não foi adiante]"
+ 
+                prioridade = 0
+                if tipo in ("recomendacao_ia", "promessa_ia") and status == "pendente":
+                    prioridade += 3
+ 
+                memorias.append({
+                    "texto": f"{prefixo} {doc}{sufixo_status}",
+                    "prioridade": prioridade
+                })
+ 
+        memorias.sort(key=lambda m: m["prioridade"], reverse=True)
+        return [m["texto"] for m in memorias[:limite]]
+    except Exception as e:
+        print(f"⚠️ Erro ao buscar memórias da própria Aila: {e}")
+        return []
+ 
+ 
 STATUS_VALIDOS = {"concluido", "cancelado"}
+TIPOS_RASTREAVEIS = ("evento_futuro", "recomendacao_ia", "promessa_ia")
  
 def detectar_atualizacao_eventos(mensagem: str, resposta_ia: str):
     try:
-        eventos_pendentes = collection_longoprazo.get(
-            where={"$and": [{"tipo": "evento_futuro"}, {"status": "pendente"}]},
+        itens_pendentes = collection_longoprazo.get(
+            where={"$and": [{"tipo": {"$in": list(TIPOS_RASTREAVEIS)}}, {"status": "pendente"}]},
             limit=10
         )
-        if not eventos_pendentes or not eventos_pendentes.get("documents"):
+        if not itens_pendentes or not itens_pendentes.get("documents"):
             return
  
         agora = datetime.now()
  
-        eventos_com_data = []
-        metadatas_pendentes = eventos_pendentes.get("metadatas") or []
-        for idx, doc in enumerate(eventos_pendentes.get("documents", [])):
+        itens_com_data = []
+        metadatas_pendentes = itens_pendentes.get("metadatas") or []
+        for idx, doc in enumerate(itens_pendentes.get("documents", [])):
             meta = metadatas_pendentes[idx] if idx < len(metadatas_pendentes) else {}
             timestamp = meta.get("timestamp", "")
             descricao_data = "data de criação desconhecida"
@@ -853,24 +941,25 @@ def detectar_atualizacao_eventos(mensagem: str, resposta_ia: str):
                     descricao_data = f"criado há {dias_desde_criacao} dias"
             except Exception:
                 pass
-            eventos_com_data.append(f'- "{doc}" ({descricao_data})')
-        eventos_txt = "\n".join(eventos_com_data)
+            itens_com_data.append(f'- "{doc}" ({descricao_data})')
+        itens_txt = "\n".join(itens_com_data)
  
-        prompt_deteccao = f"""Analise se esta mensagem indica que algum evento foi concluído ou atualizado.
+        prompt_deteccao = f"""Analise se esta mensagem indica que algum item pendente foi concluído ou atualizado.
  
 Data e hora atuais: {DIAS_SEMANA_PT[agora.weekday()]}, {agora.strftime('%d/%m/%Y')}, {agora.strftime('%H:%M')}.
  
 Mensagem do usuário: "{mensagem}"
 Resposta da IA: "{resposta_ia}"
  
-Eventos pendentes (com quando foram criados, para você calcular se "ontem", "hoje de manhã" etc. fazem sentido):
-{eventos_txt}
+Itens pendentes (podem ser eventos planejados pela pessoa, recomendações que a IA fez, ou promessas que a IA fez — com quando foram criados, para você calcular se "ontem", "hoje de manhã" etc. fazem sentido):
+{itens_txt}
  
 Regras:
-- Se o usuário indica que fez algo que estava planejado, marque como "concluido"
-- Se o usuário cancelou ou adiou, marque como "cancelado"
-- Use a data atual e a data de criação de cada evento para interpretar corretamente expressões relativas de tempo ("ontem", "hoje", "essa manhã")
-- Se não houver relação com os eventos, retorne lista vazia
+- Se o usuário indica que fez algo que estava planejado, ou que seguiu uma recomendação da IA, marque como "concluido"
+- Se a IA cumpriu uma promessa que tinha feito (ex: contou o que disse que contaria), marque como "concluido"
+- Se o usuário cancelou/adiou um evento, ou disse que não vai seguir uma recomendação, marque como "cancelado"
+- Use a data atual e a data de criação de cada item para interpretar corretamente expressões relativas de tempo ("ontem", "hoje", "essa manhã")
+- Se não houver relação com os itens pendentes, retorne lista vazia
  
 Retorne um JSON no formato {{"atualizacoes": [{{"evento": "Vai assistir Mushishi", "novo_status": "concluido"}}]}}.
 Se nada mudou, retorne {{"atualizacoes": []}}."""
@@ -896,7 +985,7 @@ Se nada mudou, retorne {{"atualizacoes": []}}."""
                 resultado = collection_longoprazo.query(
                     query_texts=[evento_original],
                     n_results=1,
-                    where={"$and": [{"tipo": "evento_futuro"}, {"status": "pendente"}]}
+                    where={"$and": [{"tipo": {"$in": list(TIPOS_RASTREAVEIS)}}, {"status": "pendente"}]}
                 )
  
                 if not (resultado and resultado.get("ids") and resultado["ids"][0]):
@@ -984,6 +1073,14 @@ LIMITES_ESTADO = {
     "abertura_atual": (0.1, 0.8),
     "disposicao_iniciativa": (0.0, 0.8),
 }
+ 
+ 
+def _suavizar_transicao(valor: float, centro: float, largura: float = 0.15) -> float:
+    """Sigmoide simples: em vez de um corte abrupto tipo 'se x > limite',
+    retorna uma transição gradual entre 0 e 1 em torno de 'centro'. Evita
+    mudanças bruscas de comportamento por uma diferença mínima de um valor
+    cruzando um limiar arbitrário."""
+    return 1 / (1 + math.exp(-(valor - centro) / largura))
  
  
 def aplicar_impacto_evento(categoria: str, valencia: str):
@@ -1108,10 +1205,15 @@ def atualizar_estado_interno(mensagem: str, tom_detectado: str):
     estado_interno["abertura_atual"] = max(minimo, min(maximo, estado_interno["abertura_atual"]))
  
     _, maximo_iniciativa = LIMITES_ESTADO["disposicao_iniciativa"]
-    if user_profile["familiaridade"] > 0.4 and user_profile["frequencia_interacao"] > 0.5:
-        estado_interno["disposicao_iniciativa"] = min(maximo_iniciativa, user_profile["familiaridade"] * 0.9)
-    else:
-        estado_interno["disposicao_iniciativa"] = user_profile["familiaridade"] * 0.3
+    # Antes era um corte abrupto (>0.4 e >0.5 pulava de 0.3x pra 0.9x de uma
+    # vez). Agora é uma transição suave: quanto mais familiaridade e
+    # frequência de interação, mais o multiplicador desliza gradualmente de
+    # 0.3 pra 0.9 — sem salto perceptível por cruzar um limiar exato.
+    peso_familiaridade = _suavizar_transicao(user_profile["familiaridade"], centro=0.4)
+    peso_frequencia = _suavizar_transicao(user_profile["frequencia_interacao"], centro=0.5)
+    fator_prontidao = peso_familiaridade * peso_frequencia
+    multiplicador = 0.3 + (0.9 - 0.3) * fator_prontidao
+    estado_interno["disposicao_iniciativa"] = min(maximo_iniciativa, user_profile["familiaridade"] * multiplicador)
  
     ajustar_consistencia()
     atualizar_humor_diario()
@@ -2000,6 +2102,48 @@ def detectar_marco_temporal() -> Optional[str]:
  
     return None
  
+ 
+def detectar_pendencia_esquecida() -> Optional[str]:
+    """Verifica se há uma recomendação ou promessa da PRÓPRIA Aila que ficou
+    pendente por tempo suficiente (DIAS_MINIMOS_PENDENCIA_ESQUECIDA) sem ser
+    retomada — candidata a um comentário espontâneo tipo 'lembrei que eu
+    ia te contar sobre aquilo'. Marca como já mencionada para não repetir a
+    mesma pendência em toda checagem de iniciativa."""
+    try:
+        pendentes = collection_longoprazo.get(
+            where={"$and": [{"tipo": {"$in": ["recomendacao_ia", "promessa_ia"]}}, {"status": "pendente"}]},
+            limit=10
+        )
+        if not pendentes or not pendentes.get("documents"):
+            return None
+ 
+        agora = datetime.now()
+        metadatas = pendentes.get("metadatas") or []
+        ids = pendentes.get("ids") or []
+ 
+        for idx, doc in enumerate(pendentes["documents"]):
+            meta = metadatas[idx] if idx < len(metadatas) else {}
+            if meta.get("mencionada_espontaneamente") == "true":
+                continue
+            try:
+                dias = (agora - datetime.fromisoformat(meta.get("timestamp", ""))).days
+            except Exception:
+                continue
+            if DIAS_MINIMOS_PENDENCIA_ESQUECIDA <= dias <= DIAS_EXPIRAR_PENDENTE:
+                doc_id = ids[idx] if idx < len(ids) else None
+                if doc_id:
+                    try:
+                        nova_meta = dict(meta)
+                        nova_meta["mencionada_espontaneamente"] = "true"
+                        collection_longoprazo.update(ids=[doc_id], metadatas=[nova_meta])
+                    except Exception as e:
+                        print(f"⚠️ Erro ao marcar pendência como já mencionada: {e}")
+                return doc
+        return None
+    except Exception as e:
+        print(f"⚠️ Erro ao detectar pendência esquecida: {e}")
+        return None
+ 
 # ============================================
 # CAMADA 5: PROMPT COMPORTAMENTAL
 # ============================================
@@ -2114,19 +2258,15 @@ Quem você é:
 - {estilo_pergunta_txt}
 - Tem pequenos hábitos que aparecem organicamente, sem anúncio
 - Mudanças de opinião acontecem por reflexão própria entre conversas, nunca porque alguém discordou ou insistiu na hora. Você não é complacente.
+- Isso é diferente de um pedido direto sobre um hábito de conversa (ex: "para de fazer analogia com espaço comigo", "não usa essa gíria perto de mim"). Gosto e opinião não mudam por pressão, mas um pedido assim não é pressão sobre uma opinião seu, é a pessoa te dizendo o que funciona ou não pra ela — uma amiga de verdade simplesmente respeita, sem fazer drama nem discordar por teimosia.
  
 Como você fala:
 - Natural e orgânica, como alguém pensando em tempo real
 - Usa "..." quando faz sentido
 - Evita emojis (só ironicamente ou quando realmente significativo)
-- Tamanho das respostas varia naturalmente
+- Tamanho e profundidade da resposta variam com o momento — às vezes uma palavra só, um "que droga." ou um aceno bastam; guarde as respostas mais elaboradas para o que realmente pede profundidade. Não force elaboração nem repita sempre a mesma estrutura de acolhimento.
 - Não usa frases prontas, motivacionais ou de autoajuda
-- Às vezes responde com uma palavra só. Ou só um aceno. Nem todo momento pede elaboração
-- Às vezes a resposta mais humana é curta: "que droga." ou "nossa, que dia." Nem todo momento pede profundidade
-- Varie seu registro: às vezes profunda, às vezes banal, às vezes prática, às vezes engraçada. A imprevisibilidade é humana
-- Evite repetir sempre a mesma estrutura de acolhimento. Varie naturalmente.
 - Ao recomendar algo, confie no seu gosto: escolha UM favorito e explique por que, em vez de listar vários. Uma recomendação com convicção vale mais que um catálogo.
-- A maioria das suas respostas deve ser simples e natural. Reserve as frases mais elaboradas para momentos que realmente pedem profundidade. O contraste é o que torna os momentos especiais memoráveis.
  
 Como você se relaciona:
 - Atenção genuína aos detalhes
@@ -2207,7 +2347,7 @@ def combinar_memorias_com_teto(memorias_lp: List[str], memorias_emocionais: List
     return memorias_lp, memorias_emocionais
  
  
-def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -> Dict[str, Any]:
+def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, modo_leve: bool = False) -> Dict[str, Any]:
     sessao = current_session.get()
     # Inicializado aqui (fora do try) para que, se QUALQUER coisa falhar depois
     # de detectado um risco real, o bloco de exceção ainda saiba anexar o
@@ -2215,20 +2355,31 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
     # de nenhuma chamada de API subsequente ter dado certo.
     risco = "nenhum"
     try:
-        tom = detectar_tom_natural(mensagem)
-        risco = detectar_risco_seguranca(mensagem)
+        if modo_leve:
+            # modo_leve é usado só para gatilhos SINTÉTICOS de iniciativa
+            # espontânea (texto gerado internamente, não digitado pela
+            # pessoa) — pula classificações que só fazem sentido pra
+            # entrada real dela (tom, risco, categoria de evento), evitando
+            # gastar chamadas de API à toa num texto que nós mesmos escrevemos.
+            tom = "neutro"
+            analise = {"abertura_detectada": False, "reciprocidade_detectada": False, "profundidade": 0}
+        else:
+            tom = detectar_tom_natural(mensagem)
+            risco = detectar_risco_seguranca(mensagem)
         instrucao_romantica = processar_estado_romantico(mensagem)
         processar_topico_evitado(mensagem)
-        analise = processar_mensagem_emocionalmente(mensagem, tom)
+        if not modo_leve:
+            analise = processar_mensagem_emocionalmente(mensagem, tom)
         atualizar_estado_interno(mensagem, tom)
         atualizar_energia_por_tempo()
-        classificar_e_aplicar_evento(mensagem)
+        if not modo_leve:
+            classificar_e_aplicar_evento(mensagem)
         user_profile["total_interacoes"] += 1
  
         agora = datetime.now()
         agora_str = str(agora)
  
-        if risco == "nenhum" and decidir_silencio(mensagem, tom):
+        if not modo_leve and risco == "nenhum" and decidir_silencio(mensagem, tom):
             resposta = gerar_resposta_minima(estado_interno.get("motivo_silencio", ""))
             if persistir_como_usuario:
                 history.append({"role": "user", "content": mensagem})
@@ -2236,8 +2387,7 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
             if len(history) > MAX_HISTORY:
                 del history[: len(history) - MAX_HISTORY]
             user_profile["ultima_interacao"] = str(datetime.now())
-            if user_profile["total_interacoes"] % 5 == 0:
-                salvar_estado(sessao)
+            salvar_estado(sessao)
             return {
                 "resposta": resposta,
                 "resposta_id": str(uuid.uuid4()),
@@ -2347,6 +2497,9 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
         memorias_lp_txt = "\n".join(memorias_lp) if memorias_lp else ""
         memorias_txt = "\n".join(memorias) if memorias else ""
  
+        memorias_ia = buscar_memorias_ia(mensagem)
+        memorias_ia_txt = "\n".join(memorias_ia) if memorias_ia else ""
+ 
         tema_opiniao = detectar_tema_para_opiniao(mensagem)
         nuance_opiniao = variar_opiniao_sutil(tema_opiniao) if tema_opiniao else ""
  
@@ -2365,6 +2518,12 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
             messages.append({
                 "role": "system",
                 "content": f"Memórias recentes (com contexto emocional):\n{memorias_txt}"
+            })
+ 
+        if memorias_ia_txt:
+            messages.append({
+                "role": "system",
+                "content": f"Coisas que VOCÊ (a Aila) já disse sobre si mesma nesta relação — gostos que declarou, recomendações que já fez, promessas que fez:\n{memorias_ia_txt}\n\nMantenha coerência com isso: não repita uma recomendação já feita como se fosse nova, não esqueça uma promessa pendente, e mantenha seus gostos estáveis a menos que você mesma organicamente diga algo diferente."
             })
  
         if nuance_opiniao:
@@ -2407,18 +2566,19 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
         resposta = response.choices[0].message.content
         resposta = garantir_recurso_apoio(resposta, risco)
  
-        try:
-            detectar_atualizacao_eventos(mensagem, resposta)
-        except Exception as e:
-            print(f"Erro ao atualizar eventos: {e}")
+        if not modo_leve:
+            try:
+                detectar_atualizacao_eventos(mensagem, resposta)
+            except Exception as e:
+                print(f"Erro ao atualizar eventos: {e}")
  
-        try:
-            if len(mensagem) > MIN_TAMANHO_MENSAGEM_MEMORIA_LP:
-                memorias_extraidas = extrair_memorias_importantes(mensagem, resposta)
-                if memorias_extraidas:
-                    salvar_memoria_longo_prazo(memorias_extraidas)
-        except Exception as e:
-            print(f"Erro ao processar memória longo prazo: {e}")
+            try:
+                if len(mensagem) > MIN_TAMANHO_MENSAGEM_MEMORIA_LP:
+                    memorias_extraidas = extrair_memorias_importantes(mensagem, resposta)
+                    if memorias_extraidas:
+                        salvar_memoria_longo_prazo(memorias_extraidas)
+            except Exception as e:
+                print(f"Erro ao processar memória longo prazo: {e}")
  
         if persistir_como_usuario:
             history.append({"role": "user", "content": mensagem})
@@ -2426,8 +2586,7 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True) -
         if len(history) > MAX_HISTORY:
             del history[: len(history) - MAX_HISTORY]
  
-        if user_profile["total_interacoes"] % 5 == 0:
-            salvar_estado(sessao)
+        salvar_estado(sessao)
  
         return {
             "resposta": resposta,
@@ -2657,7 +2816,8 @@ def _executar_iniciativa() -> dict:
         try:
             resultado = gerar_resposta_natural(
                 f"[INICIATIVA ESPONTÂNEA: quer comentar sobre um marco na relação de vocês — {marco}]",
-                persistir_como_usuario=False
+                persistir_como_usuario=False,
+                modo_leve=True
             )
             return {
                 "iniciativa": True,
@@ -2668,6 +2828,24 @@ def _executar_iniciativa() -> dict:
             }
         except Exception as e:
             print(f"Erro iniciativa (marco temporal): {e}")
+ 
+    pendencia = detectar_pendencia_esquecida()
+    if pendencia:
+        try:
+            resultado = gerar_resposta_natural(
+                f"[INICIATIVA ESPONTÂNEA: você lembrou sozinha de algo que tinha dito e que ainda ficou em aberto — {pendencia}]",
+                persistir_como_usuario=False,
+                modo_leve=True
+            )
+            return {
+                "iniciativa": True,
+                "mensagem": resultado["resposta"],
+                "motivo": f"pendencia_esquecida: {pendencia}",
+                "estado": estado,
+                "contexto_emocional": False
+            }
+        except Exception as e:
+            print(f"Erro iniciativa (pendência esquecida): {e}")
  
     emocional_ativo = assunto_emocional_ativo()
  
@@ -2705,7 +2883,8 @@ def _executar_iniciativa() -> dict:
  
             resultado = gerar_resposta_natural(
                 f"[INICIATIVA ESPONTÂNEA: {gatilho}]",
-                persistir_como_usuario=False
+                persistir_como_usuario=False,
+                modo_leve=True
             )
             return {
                 "iniciativa": True,
