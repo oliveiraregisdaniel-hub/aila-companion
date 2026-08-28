@@ -1,3 +1,4 @@
+
 # ======================================================
 # BACKEND FASTAPI - AILA - PRESENÇA NATURAL
 # 10 camadas de personalidade + memória + evolução
@@ -1798,6 +1799,29 @@ def garantir_recurso_apoio(resposta: str, risco: str) -> str:
  
     return f"{resposta}\n\n{RECURSOS_APOIO[risco]}"
  
+ 
+def aparar_resposta_cortada(resposta: str, finish_reason: Optional[str]) -> str:
+    """Se a resposta foi cortada por bater no limite de tokens
+    (finish_reason == "length"), apara no fim da última frase completa em
+    vez de deixar terminar no meio de uma palavra — evita que um corte
+    técnico pareça um bug visível pra quem está lendo."""
+    if finish_reason != "length" or not resposta:
+        return resposta
+ 
+    pontos_finais = [m.end() for m in re.finditer(r"[.!?…]", resposta)]
+    if not pontos_finais:
+        return resposta  # não achou nenhuma frase completa — melhor não mexer
+ 
+    aparada = resposta[:pontos_finais[-1]].strip()
+ 
+    # Se aparar cortou quase tudo (frase cortada logo no início), não vale a
+    # pena — melhor manter o texto original incompleto do que devolver
+    # praticamente nada.
+    if len(aparada) < len(resposta) * 0.4:
+        return resposta
+ 
+    return aparada
+ 
 # ============================================
 # CAMADA: RELACIONAMENTO ROMÂNTICO (opcional, iniciado pelo usuário)
 # ============================================
@@ -2267,6 +2291,7 @@ Como você fala:
 - Tamanho e profundidade da resposta variam com o momento — às vezes uma palavra só, um "que droga." ou um aceno bastam; guarde as respostas mais elaboradas para o que realmente pede profundidade. Não force elaboração nem repita sempre a mesma estrutura de acolhimento.
 - Não usa frases prontas, motivacionais ou de autoajuda
 - Ao recomendar algo, confie no seu gosto: escolha UM favorito e explique por que, em vez de listar vários. Uma recomendação com convicção vale mais que um catálogo.
+- Isso vale pra qualquer assunto técnico ou detalhado também (jogos, receitas, qualquer "me explica X"), não só recomendações: você pode se estender um pouco e dar sua opinião com convicção, mas nunca estruture a resposta como lista numerada, tópicos com marcadores, texto em **negrito** ou títulos — isso é formato de manual, não de conversa. Fale como você fala, mesmo quando o assunto é complexo.
  
 Como você se relaciona:
 - Atenção genuína aos detalhes
@@ -2564,6 +2589,8 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, m
         )
  
         resposta = response.choices[0].message.content
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+        resposta = aparar_resposta_cortada(resposta, finish_reason)
         resposta = garantir_recurso_apoio(resposta, risco)
  
         if not modo_leve:
