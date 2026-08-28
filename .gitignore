@@ -1,4 +1,6 @@
 __pycache__/
 chroma_db/
+estados/
 .env
 estado_companion.json
+feedback_log.jsonl
