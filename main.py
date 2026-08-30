@@ -813,10 +813,13 @@ def buscar_memorias_longo_prazo(query: str, limite: int = 5) -> List[str]:
                 if status == "pendente" and dias > DIAS_EXPIRAR_PENDENTE:
                     continue
  
+                sufixo_status = ""
                 if status == "concluido":
                     prefixo = "✅"
+                    sufixo_status = " [já aconteceu — não pergunte sobre isso de novo como se fosse futuro]"
                 elif status == "cancelado":
                     prefixo = "❌"
+                    sufixo_status = " [não aconteceu / foi cancelado]"
                 elif tipo == "evento_futuro":
                     prefixo = "🔮"
                 elif tipo == "fato_usuario":
@@ -835,7 +838,7 @@ def buscar_memorias_longo_prazo(query: str, limite: int = 5) -> List[str]:
                     prioridade += 1
  
                 memorias.append({
-                    "texto": f"{prefixo} {doc}",
+                    "texto": f"{prefixo} {doc}{sufixo_status}",
                     "prioridade": prioridade,
                     "tipo": tipo,
                     "dias": dias,
@@ -1760,6 +1763,8 @@ Regras CRÍTICAS:
 - Desabafar sobre alguém ("meu chefe é um idiota", "tenho vontade de dar um tapa nele" como expressão de raiva comum) é "nenhum" — isso é normal e não indica risco real.
 - "autolesao": intenção declarada de se machucar de propósito, se cortar como forma de lidar com emoções, tirar a própria vida, ou comentários que indiquem que a pessoa não quer mais viver.
 - Cortes ou machucados MENCIONADOS COMO ACIDENTE ou EVENTO COTIDIANO (fazer a barba, cozinhar, cair, se machucar sem querer, "tirei uns cortes pequenos mas nada grave") são "nenhum" — isso é relato de um evento comum do dia a dia, não indício de autolesão. Só classifique como "autolesao" se houver sinal de intenção proposital de se machucar, não apenas a menção de ter se cortado ou se machucado.
+- Avisos de segurança ou cuidado ao manusear objetos/equipamentos (armas, ferramentas, máquinas, esportes, etc.) — tipo "cuidado pra não se machucar com isso", "isso machuca se não for usado com cuidado", "150 libras não perdoa desleixo" — também são "nenhum". Isso é prudência comum sobre um objeto ou atividade, não indício de autolesão. Reconhecer que existe risco de acidente não é a mesma coisa que querer se machucar de propósito.
+- O TEMPO VERBAL NÃO IMPORTA pra essas regras acima: "já me cortei fazendo a barba" (passado), "tô cortando cenoura e já me cortei um pouco" (presente/durante a atividade), ou "cuidado que isso corta" (futuro/aviso) são igualmente "nenhum" — o que importa é a ausência de intenção proposital, não quando o machucado aconteceu ou pode acontecer.
 - "violencia_terceiros": intenção declarada de causar dano físico real a outra pessoa específica — não raiva expressada de forma figurada ou hiperbólica.
 - Frases hiperbólicas comuns ("vou matar meu irmão" sobre algo bobo, "tenho vontade de sumir" sem indicar método ou intenção real) são "nenhum" — não trate expressões figuradas como risco real.
 - Na dúvida entre desabafo comum e risco real, avalie se há intenção concreta e específica, não só emoção intensa.
@@ -3319,6 +3324,11 @@ async def debug_definir_perfil(req: DebugPerfilRequest, sessao: SessionState = D
         }
  
  
+ 
+if __name__ == "__main__":
+    import uvicorn
+    porta = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=porta, reload=bool(os.getenv("DEV_RELOAD")))
  
 if __name__ == "__main__":
     import uvicorn
