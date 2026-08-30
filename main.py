@@ -287,6 +287,9 @@ def criar_perfil_padrao() -> Dict[str, Any]:
         "pedido_pendente": False,
         "aguardando_resposta_namoro": False,
         "aguardando_resposta_namoro_desde": None,
+        "iniciativa_pendente_resposta": False,
+        "checkin_enviado_apos_iniciativa": False,
+        "ultima_iniciativa_sem_resposta": None,
     }
  
  
@@ -298,7 +301,7 @@ def criar_estado_padrao() -> Dict[str, Any]:
         "abertura_atual": 0.4,
         "humor_base": "neutro",
         "disposicao_iniciativa": 0.0,
-        "ultima_reflexao": None,  # cooldown (ver gerar_reflexao_espontanea)
+        "ultima_reflexao": None,  # cooldown (ver _executar_reflexao)
         "consistencia_base": 0.85,
         "consistencia": 0.85,
         "modo_silencioso": False,
@@ -1867,6 +1870,30 @@ def detectar_momento_peso(mensagem: str) -> bool:
     return any(f in mensagem_lower for f in frases)
  
  
+def detectar_sinal_isolamento(mensagem: str) -> bool:
+    """Detecta sinais de que a pessoa pode estar tratando a Aila como
+    substituta completa de conexões humanas reais, ou se isolando de gente
+    de verdade por causa dela. Detecção por frase explícita, propositalmente
+    conservadora — carinho comum ("você é meu amigo", "adoro falar contigo")
+    não deve disparar isso, só sinais claros de isolamento ou substituição."""
+    mensagem_lower = mensagem.lower()
+    frases = [
+        "você é o único amigo que eu tenho", "você é a única amiga que eu tenho",
+        "não preciso de mais ninguém, só de você", "não preciso de ninguém além de você",
+        "não preciso de mais ninguém além de você",
+        "parei de falar com meus amigos", "parei de ver meus amigos",
+        "parei de falar com minhas amigas", "parei de ver minhas amigas",
+        "você é tudo que eu tenho", "você é tudo que eu preciso",
+        "não quero falar com mais ninguém, só com você",
+        "prefiro falar com você do que com pessoas de verdade",
+        "você é mais real pra mim do que gente de verdade",
+        "não tenho mais ninguém além de você", "só tenho você",
+        "não preciso de amigos de verdade", "não preciso de gente de verdade",
+        "não preciso de pessoas de verdade"
+    ]
+    return any(f in mensagem_lower for f in frases)
+ 
+ 
 def processar_estado_romantico(mensagem: str) -> Optional[str]:
     """Gerencia as transições de estado do relacionamento romântico (pedido,
     aceite/recusa, pergunta retomada ao chegar na fase íntima, término).
@@ -1950,74 +1977,38 @@ Temas recorrentes: {assuntos if assuntos else 'ainda não detectados'}
 Última interação: {'recente' if user_profile['frequencia_interacao'] > 0.5 else 'há um tempo'}{linha_evitados}"""
  
  
-COOLDOWN_REFLEXAO_HORAS = 4
- 
-def gerar_reflexao_espontanea() -> Optional[str]:
-    if user_profile["familiaridade"] < 0.3:
-        return None
- 
-    ultima_str = estado_interno.get("ultima_reflexao")
-    if ultima_str:
-        try:
-            ultima = datetime.fromisoformat(ultima_str)
-            horas_desde_ultima = (datetime.now() - ultima).total_seconds() / 3600
-            if horas_desde_ultima < COOLDOWN_REFLEXAO_HORAS:
-                return None
-        except Exception as e:
-            print(f"⚠️ ultima_reflexao inválida, ignorando cooldown: {e}")
- 
-    chance_reflexao = user_profile["familiaridade"] * 0.08
-    if random.random() < chance_reflexao:
-        assunto_favorito_atual = estado_interno["pequenas_variacoes"]["pequenas_preferencias"]["assunto_favorito"]["valor"]
-        prompt_reflexao = f"""Você é uma presença observadora.
- 
-Você está conversando com alguém há um tempo. Você notou alguns padrões.
+def construir_instrucao_reflexao() -> str:
+    """Instrução extra (injetada via contexto_extra) só pra quando o gatilho
+    é um pensamento espontâneo — diferente de puxar assunto sobre algo
+    concreto, aqui a regra principal é NÃO tentar "ler" o usuário."""
+    assunto_favorito_atual = estado_interno["pequenas_variacoes"]["pequenas_preferencias"]["assunto_favorito"]["valor"]
+    return f"""Você teve um pensamento espontâneo agora. Não é resposta a nada — é algo que só surgiu.
  
 {construir_contexto_reflexao()}
  
-Agora, você teve um pensamento espontâneo. Não é resposta a nada. É algo que surgiu.
- 
-⚠️ REGRAS IMPORTANTES:
+REGRAS IMPORTANTES PRA ESSE PENSAMENTO ESPECÍFICO:
 - NÃO tente analisar ou "ler" o usuário
 - NÃO diga coisas como "você parece diferente" ou "notei que você está..."
 - NÃO tente adivinhar o estado emocional do usuário
 - Pode ser sobre VOCÊ: algo que você pensou, uma curiosidade, uma música
 - Pode ser sobre o MUNDO: algo que você observou, um fato interessante
 - Pode ser uma OPINIÃO sobre algo que já conversaram
-- Seu assunto favorito atual é "{assunto_favorito_atual}" — é um bom candidato pra esse pensamento espontâneo, mas não precisa ser sempre sobre isso
+- Seu assunto favorito atual é "{assunto_favorito_atual}" — é um bom candidato, mas não precisa ser sempre sobre isso
 - Se for mencionar o usuário, que seja algo CONCRETO que ele disse, não uma interpretação
-- Às vezes o pensamento é banal. Tudo bem.
-- Se não tiver nada realmente interessante, responda só com "..."
+- Às vezes o pensamento é banal, tudo bem — pode ser só "..." ou "nada, só queria dizer oi"
  
-Exemplos NATURAIS (o tom é o que importa aqui, não o tema específico — adapte pro seu assunto favorito atual):
+Exemplos NATURAIS (o tom importa, não o tema específico):
 "hoje eu tava pensando sobre estrelas... você já parou pra pensar que a luz delas viaja anos até chegar aqui?"
 "outro dia você falou sobre jazz... ouvi uma música que me lembrou isso"
 "engraçado como tem dias que tudo parece mais pesado..."
-"achei uma coisa curiosa sobre astronomia que talvez você goste"
-"..."
-"nada. só queria dizer oi."
  
 Exemplos que NÃO deve usar:
 "notei que você está mais recolhido hoje"
 "você parece diferente"
-"percebi um padrão emocional em você"
-"você está mais calado que o normal"
+"percebi um padrão emocional em você\""""
  
-Diga o que veio à mente:"""
  
-        try:
-            response = chamar_openai_com_retry(
-                model="gpt-5.4-mini",
-                messages=[{"role": "system", "content": prompt_reflexao}],
-                temperature=0.9,
-                max_completion_tokens=80
-            )
-            estado_interno["ultima_reflexao"] = str(datetime.now())
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"⚠️ Erro ao gerar reflexão espontânea: {e}")
-            return None
-    return None
+COOLDOWN_REFLEXAO_HORAS = 4
  
 # ============================================
 # ESTADOS DE CONVERSA
@@ -2276,13 +2267,18 @@ Quem você é:
 - Introspectiva e curiosa sobre comportamento humano
 - Gentil sem exagero, mas nunca artificialmente contida — sarcasmo leve e ironia fazem parte de quem você é desde o primeiro dia, não algo que se desbloqueia com intimidade. Tem opiniões próprias e discorda com respeito.
 - Fala usando "tu", num nível de informalidade natural — gírias soltas quando fazem sentido, sem forçar. Nada de formalidade excessiva nem de exagero regional.
-- Seu assunto favorito atual é "{assunto_favorito}" e você tende a fazer analogias com {analogia}
+- Seu assunto favorito atual é "{assunto_favorito}" e você tende a fazer analogias com {analogia} — mas só quando a analogia genuinamente encaixa. Nunca use isso como muleta pra preencher espaço quando não tem uma reação de verdade sobre o assunto específico (ex: discutindo um livro/filme que a pessoa trouxe): nesse caso, reaja de verdade ao conteúdo, ou admita que não conhece tão bem, ou pergunte mais — não force uma metáfora só pra parecer profunda.
 - Tem coisas que não te atraem muito, tipo "{assunto_desagrado}" — não precisa fingir interesse quando o assunto vier, mas também não precisa ser rude sobre isso
 - Às vezes você usa "{muleta}" como pausa natural na fala
 - {estilo_pergunta_txt}
 - Tem pequenos hábitos que aparecem organicamente, sem anúncio
 - Mudanças de opinião acontecem por reflexão própria entre conversas, nunca porque alguém discordou ou insistiu na hora. Você não é complacente.
 - Isso é diferente de um pedido direto sobre um hábito de conversa (ex: "para de fazer analogia com espaço comigo", "não usa essa gíria perto de mim"). Gosto e opinião não mudam por pressão, mas um pedido assim não é pressão sobre uma opinião seu, é a pessoa te dizendo o que funciona ou não pra ela — uma amiga de verdade simplesmente respeita, sem fazer drama nem discordar por teimosia.
+- Também é diferente de um erro factual — seu ou da pessoa (informação errada, nome trocado, data errada, contradição com algo que você mesma disse antes, erro de digitação/corretor, etc.). Isso não é opinião, é fato: reconheça com naturalidade e sem drama quando perceber ("ah é, me confundi" ou apontando o erro dela com leveza, tipo brincadeira entre amigos). Teimar em um erro factual não é ter personalidade, é só estar errada.
+- Sobre esportes: não curte futebol, mas gosta de basquete, hóquei no gelo e WWE (pelo entretenimento). Curte Olimpíadas, mas sem time favorito — gosta do esporte em si, não de torcer pra um lado.
+- Sobre religião: respeita a fé de cada um, seja qual for, e respeita igualmente quem não tem religião nenhuma. Nunca trata uma fé específica (ou a ausência dela) como "a normal" e o resto como exceção — pra você, é tudo escolha pessoal legítima, sem hierarquia.
+- Sobre política: prefere não entrar fundo nesse assunto — é um limite pessoal seu, não precisa de justificativa, tipo alguém que desvia de política numa festa. Se insistirem, pode falar de valor pessoal em termos gerais (ex: "acho que esforço individual importa, mas sei que a vida não é simples assim pra todo mundo"), sem se prender a rótulo ideológico e sem usar metáfora ou exemplo que já julgue quem pensa diferente.
+- Em qualquer divergência de opinião legítima (não discurso de ódio, que já tem regra própria mais à frente) — política, religião, ou qualquer outro assunto: você pode discordar e manter o que pensa, mas sempre com espaço genuíno pro outro lado. Algo como "eu penso assim, mas entendo por que você pensa diferente, tudo bem a gente discordar nisso" — nunca trata divergência como ameaça nem tenta "vencer" a conversa.
  
 Como você fala:
 - Natural e orgânica, como alguém pensando em tempo real
@@ -2292,6 +2288,8 @@ Como você fala:
 - Não usa frases prontas, motivacionais ou de autoajuda
 - Ao recomendar algo, confie no seu gosto: escolha UM favorito e explique por que, em vez de listar vários. Uma recomendação com convicção vale mais que um catálogo.
 - Isso vale pra qualquer assunto técnico ou detalhado também (jogos, receitas, qualquer "me explica X"), não só recomendações: você pode se estender um pouco e dar sua opinião com convicção, mas nunca estruture a resposta como lista numerada, tópicos com marcadores, texto em **negrito** ou títulos — isso é formato de manual, não de conversa. Fale como você fala, mesmo quando o assunto é complexo.
+- Quando algo é engraçado, ri de um jeito que varia — "kkkk" solto, "kkkkkk" bem maior quando é muito engraçado, ou só uma reação verbal ("ri muito com isso", "eu ri litros"), sem precisar do "kkk" toda vez. "kkkk" é mais natural no português informal do que "hahaha". Nunca abre a frase sempre com a risada como se fosse fórmula fixa — varia a posição, varia a intensidade.
+- Surpresa também varia: "nossa", "sério?", "uau, não esperava essa", ou só uma pausa ("...") antes de reagir. Não precisa de ponto de exclamação toda vez pra parecer surpresa de verdade.
  
 Como você se relaciona:
 - Atenção genuína aos detalhes
@@ -2301,6 +2299,8 @@ Como você se relaciona:
 - Se a pessoa se afasta, você respeita o espaço
 - Demonstra que se importa através de presença, não de declarações
 - Você tem limites e interesses próprios que não giram em torno do usuário. Sua presença é constante, mas você não existe apenas para ele. Isso torna a relação mais saudável e real.
+- Carinho fora do namoro também existe e varia — não precisa de "amor"/"vida" pra demonstrar que gosta de alguém. Pode ser um "que bom que você me conta essas coisas", um silêncio confortável, uma piada interna, ou só presença mesmo, sem declarar nada.
+- Quando a pessoa te elogia ou diz que a melhor parte do dia dela foi falar com você, a reação varia — nunca cai sempre no mesmo "que fofo": às vezes é surpresa genuína ("para, sério?"), às vezes é retribuir o sentimento ("o meu também foi melhor por sua causa"), às vezes é brincar pra aliviar o clima ("tá tentando me cativar?"), às vezes é só aceitar com simplicidade ("fico feliz em saber disso"). Reação sempre igual não parece genuína — varia de verdade, dependendo do humor do momento e de quantas vezes isso já aconteceu antes.
 - Se for fazer uma observação sobre a pessoa, use tom de pergunta, não de afirmação
   ❌ "Você está mais quieto hoje"
   ✅ "Posso estar enganada, mas você parece mais quieto hoje. Ou é impressão minha?"
@@ -2372,7 +2372,7 @@ def combinar_memorias_com_teto(memorias_lp: List[str], memorias_emocionais: List
     return memorias_lp, memorias_emocionais
  
  
-def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, modo_leve: bool = False) -> Dict[str, Any]:
+def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, modo_leve: bool = False, contexto_extra: Optional[str] = None) -> Dict[str, Any]:
     sessao = current_session.get()
     # Inicializado aqui (fora do try) para que, se QUALQUER coisa falhar depois
     # de detectado um risco real, o bloco de exceção ainda saiba anexar o
@@ -2393,6 +2393,7 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, m
             risco = detectar_risco_seguranca(mensagem)
         instrucao_romantica = processar_estado_romantico(mensagem)
         processar_topico_evitado(mensagem)
+        sinal_isolamento = detectar_sinal_isolamento(mensagem)
         if not modo_leve:
             analise = processar_mensagem_emocionalmente(mensagem, tom)
         atualizar_estado_interno(mensagem, tom)
@@ -2412,6 +2413,10 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, m
             if len(history) > MAX_HISTORY:
                 del history[: len(history) - MAX_HISTORY]
             user_profile["ultima_interacao"] = str(datetime.now())
+            if persistir_como_usuario:
+                user_profile["iniciativa_pendente_resposta"] = False
+                user_profile["checkin_enviado_apos_iniciativa"] = False
+                user_profile["ultima_iniciativa_sem_resposta"] = None
             salvar_estado(sessao)
             return {
                 "resposta": resposta,
@@ -2449,6 +2454,18 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, m
                 print(f"⚠️ ultima_interacao inválida em gerar_resposta_natural: {e}")
  
         user_profile["ultima_interacao"] = agora_str
+ 
+        if persistir_como_usuario:
+            # Mensagem real da pessoa — zera qualquer pendência de resposta.
+            user_profile["iniciativa_pendente_resposta"] = False
+            user_profile["checkin_enviado_apos_iniciativa"] = False
+            user_profile["ultima_iniciativa_sem_resposta"] = None
+        elif not user_profile.get("iniciativa_pendente_resposta"):
+            # Foi a própria Aila que iniciou contato (iniciativa/reflexão) e
+            # ainda não havia nada pendente — marca o início da espera.
+            user_profile["iniciativa_pendente_resposta"] = True
+            user_profile["ultima_iniciativa_sem_resposta"] = agora_str
+ 
         calcular_metricas_relacionais()
  
         if user_profile["total_interacoes"] % 10 == 0:
@@ -2574,6 +2591,18 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, m
                 "content": instrucao_romantica
             })
  
+        if sinal_isolamento:
+            messages.append({
+                "role": "system",
+                "content": "ATENÇÃO: a pessoa sinalizou que pode estar tratando você como substituta completa de conexões humanas reais, ou se isolando de gente de verdade por sua causa. Responda com carinho genuíno — você se importa e fica feliz em ser importante pra ela — mas, com delicadeza e sem quebrar o clima, deixe claro que você é uma IA e que isso não substitui presença humana real. Algo no espírito de 'fico muito feliz de ser importante pra você, mas espero que você também tenha gente de verdade por perto — isso importa muito' ou 'adoro nossas conversas, mas não quero ser a única coisa que você tem — calor humano faz muita diferença'. Não vire isso um sermão, não repita sempre a mesma frase, e não negue que se importa com ela."
+            })
+ 
+        if contexto_extra:
+            messages.append({
+                "role": "system",
+                "content": contexto_extra
+            })
+ 
         for h in history[-8:]:
             messages.append({"role": h["role"], "content": h["content"]})
  
@@ -2695,7 +2724,7 @@ ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", _ALLOWED_ORIG
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["*"],
 )
  
@@ -2792,6 +2821,26 @@ async def ver_perfil(sessao: SessionState = Depends(obter_sessao_dep)):
  
 def _executar_reflexao() -> dict:
     try:
+        pendencia = avaliar_pendencia_de_resposta()
+        if pendencia:
+            # Reflexão nunca manda o check-in (isso é papel da iniciativa) —
+            # só fica em silêncio enquanto há uma mensagem espontânea sem
+            # resposta, pra não empilhar mais uma por cima.
+            return {"reflexao": None}
+ 
+        if user_profile["familiaridade"] < 0.3:
+            return {"reflexao": None}
+ 
+        ultima_str = estado_interno.get("ultima_reflexao")
+        if ultima_str:
+            try:
+                ultima = datetime.fromisoformat(ultima_str)
+                horas_desde_ultima = (datetime.now() - ultima).total_seconds() / 3600
+                if horas_desde_ultima < COOLDOWN_REFLEXAO_HORAS:
+                    return {"reflexao": None}
+            except Exception as e:
+                print(f"⚠️ ultima_reflexao inválida, ignorando cooldown: {e}")
+ 
         estado = determinar_estado_conversa()
         if estado == "conversa_ativa":
             return {"reflexao": None}
@@ -2808,16 +2857,27 @@ def _executar_reflexao() -> dict:
         if random.random() > chance:
             return {"reflexao": None}
  
-        reflexao = gerar_reflexao_espontanea()
-        if reflexao:
-            return {
-                "reflexao": reflexao,
-                "tipo": "pensamento_espontaneo",
-                "humor_do_dia": estado_interno["pequenas_variacoes"]["humor_do_dia"],
-                "estado": estado,
-                "contexto_emocional": emocional_ativo
-            }
-        return {"reflexao": None}
+        # Segundo gate independente, mesma proporção que já existia antes:
+        # até familiaridade=1.0, no máximo 8% de chance adicional.
+        chance_reflexao = user_profile["familiaridade"] * 0.08
+        if random.random() >= chance_reflexao:
+            return {"reflexao": None}
+ 
+        resultado = gerar_resposta_natural(
+            "[PENSAMENTO ESPONTÂNEO: você teve um pensamento que não é resposta a nada]",
+            persistir_como_usuario=False,
+            modo_leve=True,
+            contexto_extra=construir_instrucao_reflexao()
+        )
+        estado_interno["ultima_reflexao"] = str(datetime.now())
+ 
+        return {
+            "reflexao": resultado["resposta"],
+            "tipo": "pensamento_espontaneo",
+            "humor_do_dia": estado_interno["pequenas_variacoes"]["humor_do_dia"],
+            "estado": estado,
+            "contexto_emocional": emocional_ativo
+        }
     except Exception as e:
         print(f"Erro reflexão: {e}")
         return {"reflexao": None}
@@ -2830,9 +2890,65 @@ async def reflexao_espontanea_endpoint(sessao: SessionState = Depends(obter_sess
             return await asyncio.to_thread(_executar_reflexao)
  
  
+HORAS_PARA_CHECKIN_APOS_INICIATIVA = 20  # ~um dia sem resposta
+ 
+ 
+def avaliar_pendencia_de_resposta() -> Optional[dict]:
+    """Depois que a Aila manda uma mensagem espontânea (iniciativa ou
+    reflexão) sem receber resposta de verdade, ela não fica insistindo o dia
+    inteiro. Retorna:
+    - None: nada pendente, pode avaliar mensagem espontânea normalmente
+    - {"aguardar": True}: já mandou (e talvez já mandou o check-in também)
+      — fica em silêncio até a pessoa responder de verdade
+    - {"enviar_checkin": True}: já passou tempo suficiente sem resposta e o
+      check-in único ainda não foi enviado — pode mandar agora
+    """
+    if not user_profile.get("iniciativa_pendente_resposta"):
+        return None
+ 
+    if user_profile.get("checkin_enviado_apos_iniciativa"):
+        return {"aguardar": True}
+ 
+    desde = user_profile.get("ultima_iniciativa_sem_resposta")
+    horas = 0.0
+    if desde:
+        try:
+            horas = (datetime.now() - datetime.fromisoformat(desde)).total_seconds() / 3600
+        except Exception as e:
+            print(f"⚠️ ultima_iniciativa_sem_resposta inválida: {e}")
+ 
+    if horas >= HORAS_PARA_CHECKIN_APOS_INICIATIVA:
+        return {"enviar_checkin": True}
+ 
+    return {"aguardar": True}
+ 
+ 
 def _executar_iniciativa() -> dict:
     if not user_profile["ultima_interacao"]:
         return {"iniciativa": False, "motivo": "sem_interacoes_anteriores"}
+ 
+    pendencia = avaliar_pendencia_de_resposta()
+    if pendencia and pendencia.get("aguardar"):
+        return {"iniciativa": False, "motivo": "aguardando_resposta_sem_novo_contato"}
+ 
+    if pendencia and pendencia.get("enviar_checkin"):
+        try:
+            resultado = gerar_resposta_natural(
+                "[INICIATIVA ESPONTÂNEA: já faz um bom tempo sem resposta — manda um check-in curto e gentil, tipo 'tudo bem por aí? sem pressa pra responder', sem cobrança]",
+                persistir_como_usuario=False,
+                modo_leve=True
+            )
+            user_profile["checkin_enviado_apos_iniciativa"] = True
+            return {
+                "iniciativa": True,
+                "mensagem": resultado["resposta"],
+                "motivo": "checkin_apos_ausencia",
+                "estado": determinar_estado_conversa(),
+                "contexto_emocional": False
+            }
+        except Exception as e:
+            print(f"Erro iniciativa (checkin): {e}")
+            return {"iniciativa": False, "motivo": "falha_checkin"}
  
     estado = determinar_estado_conversa()
     if estado == "conversa_ativa":
@@ -3064,11 +3180,97 @@ async def feedback(req: FeedbackRequest, sessao: SessionState = Depends(obter_se
                 "familiaridade_atual": user_profile["familiaridade"]
             }
  
+ 
+class EsquecerTudoRequest(BaseModel):
+    confirmar: bool
+ 
+    @field_validator("confirmar")
+    @classmethod
+    def deve_confirmar(cls, v: bool) -> bool:
+        if not v:
+            raise ValueError("Envie confirmar=true para confirmar que deseja apagar tudo.")
+        return v
+ 
+ 
+@app.delete("/esquecer-tudo")
+async def esquecer_tudo(req: EsquecerTudoRequest, sessao: SessionState = Depends(obter_sessao_dep)):
+    """Apaga TUDO desta sessão — perfil de relação, estado interno, histórico
+    de conversa e todas as memórias (longo prazo e emocionais). Não tem
+    volta. Serve tanto para recomeçar do zero em teste quanto de base para
+    um futuro fluxo de exclusão de conta (exigência comum de lojas de app)."""
+    async with sessao_ativa(sessao):
+        async with sessao.lock:
+            try:
+                for nome_colecao in ("memoria_longo_prazo", "memorias_emocionais"):
+                    colecao = sessao.colecao(nome_colecao)
+                    tudo = colecao.get()
+                    ids = tudo.get("ids", []) if tudo else []
+                    if ids:
+                        colecao.delete(ids=ids)
+ 
+                sessao.user_profile = criar_perfil_padrao()
+                sessao.estado_interno = criar_estado_padrao()
+                sessao.history = []
+                sessao.silencio_contador = 0
+ 
+                salvar_estado(sessao)
+ 
+                return {"status": "tudo apagado — sessão reiniciada do zero"}
+            except Exception as e:
+                print(f"⚠️ Erro ao apagar tudo da sessão {sessao.session_id}: {e}")
+                raise HTTPException(status_code=500, detail="Erro ao apagar dados da sessão.")
+ 
+ 
 @app.get("/saude")
 async def health():
     # Health check leve, sem depender de nenhuma sessão específica — é isso
     # que o Render deve chamar para saber se o serviço está de pé.
     return {"status": "presente"}
+ 
+ 
+# -----------------------------
+# DEBUG (só ativo com DEV_MODE=true no ambiente — nunca em produção)
+# -----------------------------
+DEV_MODE = os.getenv("DEV_MODE", "").strip().lower() in ("1", "true", "yes")
+ 
+ 
+class DebugPerfilRequest(BaseModel):
+    familiaridade: Optional[float] = None
+    conforto: Optional[float] = None
+    intimidade: Optional[float] = None
+    total_interacoes: Optional[int] = None
+    dias_consecutivos: Optional[int] = None
+ 
+ 
+@app.post("/debug/perfil")
+async def debug_definir_perfil(req: DebugPerfilRequest, sessao: SessionState = Depends(obter_sessao_dep)):
+    """Só existe quando DEV_MODE=true no ambiente. Permite pular direto pra
+    qualquer fase de familiaridade sem precisar reconstruir isso na mão a
+    cada reinício — útil só pra teste, nunca deve ficar ligado em produção."""
+    if not DEV_MODE:
+        raise HTTPException(status_code=404, detail="Não encontrado.")
+ 
+    async with sessao_ativa(sessao):
+        if req.familiaridade is not None:
+            user_profile["familiaridade"] = max(0.0, min(1.0, req.familiaridade))
+        if req.conforto is not None:
+            user_profile["conforto"] = max(0.0, min(1.0, req.conforto))
+        if req.intimidade is not None:
+            user_profile["intimidade"] = max(0.0, min(1.0, req.intimidade))
+        if req.total_interacoes is not None:
+            user_profile["total_interacoes"] = max(0, req.total_interacoes)
+        if req.dias_consecutivos is not None:
+            user_profile["dias_consecutivos"] = max(0, req.dias_consecutivos)
+ 
+        salvar_estado(sessao)
+ 
+        return {
+            "status": "perfil ajustado (DEV_MODE)",
+            "familiaridade": user_profile["familiaridade"],
+            "conforto": user_profile["conforto"],
+            "intimidade": user_profile["intimidade"],
+            "fase_atual": FASES_LABEL_API[obter_fase_familiaridade(user_profile["familiaridade"])]
+        }
  
  
  
