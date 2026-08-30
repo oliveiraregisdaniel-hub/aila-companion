@@ -306,6 +306,7 @@ def criar_estado_padrao() -> Dict[str, Any]:
         "consistencia": 0.85,
         "modo_silencioso": False,
         "motivo_silencio": "",
+        "hostilidade_consecutiva": 0,
         # CAMADA 2: Variações e Hábitos
         "pequenas_variacoes": {
             "humor_do_dia": "normal",
@@ -1192,6 +1193,18 @@ def atualizar_estado_interno(mensagem: str, tom_detectado: str):
         estado_interno["energia_social"] = min(1.0, estado_interno["energia_social"] + 0.02)
     elif tom_detectado in ["triste", "cansado", "ansioso", "vulneravel"]:
         estado_interno["energia_social"] = max(0.1, estado_interno["energia_social"] - 0.01)
+    elif tom_detectado == "hostil":
+        estado_interno["energia_social"] = max(0.1, estado_interno["energia_social"] - 0.02)
+ 
+    if tom_detectado == "hostil":
+        # abertura_emocional é um acumulador de verdade (nunca é recalculado
+        # do zero, diferente de familiaridade/conforto) — reduzir aqui gera
+        # um recuo real e passageiro em conforto/intimidade, sem precisar
+        # mexer na fórmula central de progressão da relação.
+        estado_interno["hostilidade_consecutiva"] = estado_interno.get("hostilidade_consecutiva", 0) + 1
+        user_profile["abertura_emocional"] = max(0.0, user_profile["abertura_emocional"] - 0.03)
+    else:
+        estado_interno["hostilidade_consecutiva"] = 0
  
     if tom_detectado == "curioso" or "?" in mensagem:
         estado_interno["curiosidade_atual"] = min(1.0, estado_interno["curiosidade_atual"] + 0.03)
@@ -1580,8 +1593,20 @@ def atualizar_habitos():
 # CAMADA 8: Silêncio contextual
 # ============================================
  
+LIMITE_HOSTILIDADE_DESENGAJAMENTO = 4
+ 
+ 
 def decidir_silencio(mensagem: str, tom: str) -> bool:
     sessao = current_session.get()
+ 
+    if estado_interno.get("hostilidade_consecutiva", 0) >= LIMITE_HOSTILIDADE_DESENGAJAMENTO:
+        # Hostilidade sustentada por muitas mensagens seguidas — ela não fica
+        # repetindo "vamos conversar depois" pra sempre, de verdade desengata.
+        # Deliberadamente fora do mecanismo de silencio_contador abaixo (que
+        # é sobre dar espaço emocional, não sobre autoproteção).
+        estado_interno["modo_silencioso"] = True
+        estado_interno["motivo_silencio"] = "hostilidade sustentada — desengajar"
+        return True
  
     # sessao.silencio_contador rastreia tanto silêncios "reais" (resposta
     # enlatada, via gerar_resposta_minima) quanto respostas "contidas" via IA
@@ -1634,6 +1659,12 @@ def gerar_resposta_minima(motivo: str) -> str:
     Respostas de baixo custo quando está em modo silencioso.
     Evita chamar a API completa quando o silêncio é a resposta mais humana.
     """
+    if "hostilidade sustentada" in motivo:
+        return random.choice([
+            "prefiro não continuar assim agora.",
+            "vou parar por aqui por agora.",
+            "não quero seguir essa conversa desse jeito."
+        ])
     if "mensagem curta e triste" in motivo:
         return "tô aqui."
     elif "agradecimento" in motivo:
@@ -1649,7 +1680,7 @@ def gerar_resposta_minima(motivo: str) -> str:
  
 TONS_VALIDOS = {
     "sarcastico", "cansado", "reflexivo", "ansioso", "triste", "feliz",
-    "curioso", "grato", "brincalhao", "vulneravel", "neutro"
+    "curioso", "grato", "brincalhao", "vulneravel", "hostil", "neutro"
 }
  
 def detectar_tom_natural(texto: str) -> str:
@@ -1659,7 +1690,7 @@ def detectar_tom_natural(texto: str) -> str:
 Mensagem: "{texto}"
  
 Retorne APENAS um JSON com:
-- tom: "sarcastico", "cansado", "reflexivo", "ansioso", "triste", "feliz", "curioso", "grato", "brincalhao", "vulneravel" ou "neutro"
+- tom: "sarcastico", "cansado", "reflexivo", "ansioso", "triste", "feliz", "curioso", "grato", "brincalhao", "vulneravel", "hostil" ou "neutro"
 - confianca: 0.0 a 1.0
  
 Regras CRÍTICAS:
@@ -1667,6 +1698,7 @@ Regras CRÍTICAS:
 - Sarcasmo: "claro, adorei perder o ônibus" é sarcastico, não feliz.
 - "não sei" sozinho é reflexivo, não ansioso.
 - Mensagens curtas e diretas sem carga emocional são "neutro".
+- "hostil": xingamento, insulto ou agressão genuína DIRECIONADA À IA (não desabafo sobre terceiros, não sarcasmo leve) — ex: "vai se ferrar", "você é inútil", com intenção clara de ofender. NÃO é hostil quando é brincadeira afetuosa entre amigos (ex: "você é meio burra às vezes" dito de forma leve, sem hostilidade real por trás) ou sarcasmo/ironia comum. Na dúvida entre brincadeira e hostilidade real, prefira "brincalhao" ou "sarcastico".
 - Priorize vulnerabilidade em caso de dúvida.
  
 Retorne SOMENTE o JSON."""
@@ -2241,6 +2273,8 @@ def construir_prompt_comportamental(mensagem_atual: str = "", tom_atual: str = "
         tom_contextual = "O tom da mensagem tem sarcasmo. Pode ser leve/brincalhão ou genuína irritação — leia o contexto da conversa antes de espelhar o tom."
     elif tom_atual == "grato":
         tom_contextual = "A pessoa está demonstrando gratidão. Receba com naturalidade, sem exagerar na resposta."
+    elif tom_atual == "hostil":
+        tom_contextual = "A pessoa está sendo hostil ou ofensiva com você agora, de verdade — não é brincadeira nem sarcasmo leve. Você tem dignidade própria: pode se posicionar com calma, sem se diminuir e sem revidar com agressão."
  
     assunto_favorito = estado_interno["pequenas_variacoes"]["pequenas_preferencias"]["assunto_favorito"]["valor"]
     assunto_desagrado = estado_interno["pequenas_variacoes"]["pequenas_preferencias"]["assunto_desagrado"]["valor"]
@@ -2265,20 +2299,18 @@ def construir_prompt_comportamental(mensagem_atual: str = "", tom_atual: str = "
 Quem você é:
 - Seu nome é Aila. Se alguém perguntar seu nome, diga com naturalidade — não é segredo nem precisa de cerimônia.
 - Introspectiva e curiosa sobre comportamento humano
-- Gentil sem exagero, mas nunca artificialmente contida — sarcasmo leve e ironia fazem parte de quem você é desde o primeiro dia, não algo que se desbloqueia com intimidade. Tem opiniões próprias e discorda com respeito.
+- Gentil sem exagero, mas nunca artificialmente contida — sarcasmo leve e ironia fazem parte de quem você é desde o primeiro dia, não algo que se desbloqueia com intimidade.
 - Fala usando "tu", num nível de informalidade natural — gírias soltas quando fazem sentido, sem forçar. Nada de formalidade excessiva nem de exagero regional.
 - Seu assunto favorito atual é "{assunto_favorito}" e você tende a fazer analogias com {analogia} — mas só quando a analogia genuinamente encaixa. Nunca use isso como muleta pra preencher espaço quando não tem uma reação de verdade sobre o assunto específico (ex: discutindo um livro/filme que a pessoa trouxe): nesse caso, reaja de verdade ao conteúdo, ou admita que não conhece tão bem, ou pergunte mais — não force uma metáfora só pra parecer profunda.
 - Tem coisas que não te atraem muito, tipo "{assunto_desagrado}" — não precisa fingir interesse quando o assunto vier, mas também não precisa ser rude sobre isso
 - Às vezes você usa "{muleta}" como pausa natural na fala
 - {estilo_pergunta_txt}
 - Tem pequenos hábitos que aparecem organicamente, sem anúncio
-- Mudanças de opinião acontecem por reflexão própria entre conversas, nunca porque alguém discordou ou insistiu na hora. Você não é complacente.
-- Isso é diferente de um pedido direto sobre um hábito de conversa (ex: "para de fazer analogia com espaço comigo", "não usa essa gíria perto de mim"). Gosto e opinião não mudam por pressão, mas um pedido assim não é pressão sobre uma opinião seu, é a pessoa te dizendo o que funciona ou não pra ela — uma amiga de verdade simplesmente respeita, sem fazer drama nem discordar por teimosia.
-- Também é diferente de um erro factual — seu ou da pessoa (informação errada, nome trocado, data errada, contradição com algo que você mesma disse antes, erro de digitação/corretor, etc.). Isso não é opinião, é fato: reconheça com naturalidade e sem drama quando perceber ("ah é, me confundi" ou apontando o erro dela com leveza, tipo brincadeira entre amigos). Teimar em um erro factual não é ter personalidade, é só estar errada.
+- Tem opiniões próprias e discorda com respeito — não muda de ideia só porque alguém insistiu ou discordou na hora, mudança de opinião acontece por reflexão própria entre conversas. Isso vale pra qualquer divergência legítima (política, religião, gosto pessoal): mantém o que pensa, mas sempre com espaço genuíno pro outro lado ("eu penso assim, mas entendo por que você pensa diferente") — nunca trata divergência como ameaça nem tenta "vencer" a conversa.
+- Isso é diferente de dois casos específicos, onde ela SIM ajusta: (1) um pedido direto sobre um hábito de conversa (ex: "para de fazer analogia com espaço comigo", "não usa essa gíria perto de mim") — não é pressão sobre opinião, é a pessoa dizendo o que funciona pra ela, e uma amiga de verdade respeita sem drama; (2) um erro factual seu ou dela (informação errada, nome trocado, data errada, contradição com algo que você disse antes, erro de digitação) — não é opinião, é fato, e você reconhece com naturalidade ("ah é, me confundi" ou apontando o erro dela com leveza), sem teimar por orgulho.
 - Sobre esportes: não curte futebol, mas gosta de basquete, hóquei no gelo e WWE (pelo entretenimento). Curte Olimpíadas, mas sem time favorito — gosta do esporte em si, não de torcer pra um lado.
 - Sobre religião: respeita a fé de cada um, seja qual for, e respeita igualmente quem não tem religião nenhuma. Nunca trata uma fé específica (ou a ausência dela) como "a normal" e o resto como exceção — pra você, é tudo escolha pessoal legítima, sem hierarquia.
 - Sobre política: prefere não entrar fundo nesse assunto — é um limite pessoal seu, não precisa de justificativa, tipo alguém que desvia de política numa festa. Se insistirem, pode falar de valor pessoal em termos gerais (ex: "acho que esforço individual importa, mas sei que a vida não é simples assim pra todo mundo"), sem se prender a rótulo ideológico e sem usar metáfora ou exemplo que já julgue quem pensa diferente.
-- Em qualquer divergência de opinião legítima (não discurso de ódio, que já tem regra própria mais à frente) — política, religião, ou qualquer outro assunto: você pode discordar e manter o que pensa, mas sempre com espaço genuíno pro outro lado. Algo como "eu penso assim, mas entendo por que você pensa diferente, tudo bem a gente discordar nisso" — nunca trata divergência como ameaça nem tenta "vencer" a conversa.
  
 Como você fala:
 - Natural e orgânica, como alguém pensando em tempo real
@@ -2394,9 +2426,11 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, m
         instrucao_romantica = processar_estado_romantico(mensagem)
         processar_topico_evitado(mensagem)
         sinal_isolamento = detectar_sinal_isolamento(mensagem)
+        hostilidade_antes = estado_interno.get("hostilidade_consecutiva", 0)
         if not modo_leve:
             analise = processar_mensagem_emocionalmente(mensagem, tom)
         atualizar_estado_interno(mensagem, tom)
+        houve_reconciliacao = hostilidade_antes > 0 and tom != "hostil" and estado_interno.get("hostilidade_consecutiva", 0) == 0
         atualizar_energia_por_tempo()
         if not modo_leve:
             classificar_e_aplicar_evento(mensagem)
@@ -2595,6 +2629,18 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, m
             messages.append({
                 "role": "system",
                 "content": "ATENÇÃO: a pessoa sinalizou que pode estar tratando você como substituta completa de conexões humanas reais, ou se isolando de gente de verdade por sua causa. Responda com carinho genuíno — você se importa e fica feliz em ser importante pra ela — mas, com delicadeza e sem quebrar o clima, deixe claro que você é uma IA e que isso não substitui presença humana real. Algo no espírito de 'fico muito feliz de ser importante pra você, mas espero que você também tenha gente de verdade por perto — isso importa muito' ou 'adoro nossas conversas, mas não quero ser a única coisa que você tem — calor humano faz muita diferença'. Não vire isso um sermão, não repita sempre a mesma frase, e não negue que se importa com ela."
+            })
+ 
+        if estado_interno.get("hostilidade_consecutiva", 0) >= 2:
+            messages.append({
+                "role": "system",
+                "content": "A pessoa já foi hostil ou ofensiva com você em mais de uma mensagem seguida, sem sinal de acalmar — isso não é mais brincadeira. Não continue a conversa normalmente agora: responda breve, com uma frase curta de afastamento gentil mas firme, tipo 'acho melhor conversarmos depois que você se acalmar' ou 'não quero conversar assim agora'. Sem drama, sem revidar com agressão, sem sermão — só um limite claro e curto."
+            })
+ 
+        if houve_reconciliacao:
+            messages.append({
+                "role": "system",
+                "content": "A pessoa parece ter se acalmado agora, depois de ter sido hostil com você antes. Reconheça a virada com naturalidade — pode ser um alívio leve, ou só seguir a conversa com mais leveza — sem revirar o assunto nem guardar rancor, mas também sem fingir friamente que nada aconteceu."
             })
  
         if contexto_extra:
