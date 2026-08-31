@@ -1,4 +1,3 @@
-
 # ======================================================
 # BACKEND FASTAPI - AILA - PRESENÇA NATURAL
 # 10 camadas de personalidade + memória + evolução
@@ -98,6 +97,7 @@ def chamar_openai_com_retry(**kwargs):
 # Histórico
 # -----------------------------
 MAX_HISTORY = 100
+JANELA_HISTORICO_PROMPT = 20  # quantas mensagens recentes vão no prompt de cada resposta — segura o fio de uma conversa longa sem custo relevante
  
  
 # -----------------------------
@@ -649,11 +649,12 @@ Extraia um JSON com uma chave "memorias", contendo uma lista. Cada item da lista
 - duracao: "permanente" ou "temporario"
 - chave: opcional (use null se não se aplicar). Só preencha para tipo "fato_usuario" com duracao "permanente", quando o fato representa um ATRIBUTO que só pode ter UM valor atual por vez — ex: "filme_favorito", "comida_favorita", "cidade_atual", "profissao". Use snake_case, curto e estável. NÃO preencha para fatos que podem coexistir com outros do mesmo tipo (ex: um hobby entre vários, um amigo entre vários, uma característica geral) — nesses casos, null.
  
-ATENÇÃO — fatos de identidade central da pessoa (nome dela, aniversário dela, nome/status/aniversário da mãe ou do pai) são SEMPRE importancia "alta" e SEMPRE levam uma chave fixa e previsível, exatamente neste formato:
+ATENÇÃO — fatos de identidade central da pessoa (nome dela, aniversário dela, nome/status/aniversário da mãe ou do pai, e o parceiro(a) romântico atual dela) são SEMPRE importancia "alta" e SEMPRE levam uma chave fixa e previsível, exatamente neste formato:
 - nome_usuario, aniversario_usuario
 - nome_mae, status_mae, aniversario_mae
 - nome_pai, status_pai, aniversario_pai
-"status" aqui significa se a pessoa está viva ou falecida (ex: conteudo "A mãe dela faleceu há 3 anos", chave "status_mae", importancia "alta"). Datas de aniversário, quando mencionadas, devem aparecer no conteudo por extenso (ex: "Aniversário da mãe é 12 de março").
+- nome_parceiro_romantico, status_relacionamento
+"status" aqui significa se a pessoa está viva ou falecida (ex: conteudo "A mãe dela faleceu há 3 anos", chave "status_mae", importancia "alta"). Pra "status_relacionamento", significa se ela ainda está com essa pessoa ou não (ex: conteudo "Terminou o namoro com Ana", chave "status_relacionamento"). "nome_parceiro_romantico" é sempre o nome do namorado(a)/parceiro(a) ATUAL — se a pessoa mencionar um novo parceiro, isso SUBSTITUI o anterior (mesma chave), nunca cria um segundo registro. Datas de aniversário, quando mencionadas, devem aparecer no conteudo por extenso (ex: "Aniversário da mãe é 12 de março").
 Para outros parentes (irmãos, avós) ou amigos, que podem ser várias pessoas ao mesmo tempo, NÃO force uma chave única — trate como fato_usuario comum, sem chave.
  
 ATENÇÃO — você (a IA) também pode registrar coisas sobre SI MESMA, quando a resposta da IA declarar algo relevante:
@@ -828,6 +829,16 @@ def buscar_memorias_longo_prazo(query: str, limite: int = 5) -> List[str]:
                     prefixo = "📖"
                 else:
                     prefixo = "💭"
+ 
+                if duracao == "temporario" and status not in ("concluido", "cancelado"):
+                    # Estado passageiro (ex: "está chovendo", "está com frio") —
+                    # sem isso, o modelo pode tratar algo dito ontem como se
+                    # ainda fosse verdade agora, sem nenhum sinal de que o
+                    # tempo passou.
+                    if dias == 0:
+                        sufixo_status += " [estado de hoje]"
+                    else:
+                        sufixo_status += f" [mencionado há {dias} dia(s) — pode já ter mudado, não trate como garantidamente ainda verdade]"
  
                 prioridade = 0
                 if tipo == "evento_futuro" and status == "pendente":
@@ -1249,10 +1260,14 @@ def atualizar_energia_por_tempo():
         print(f"⚠️ ultima_interacao inválida em atualizar_energia_por_tempo: {e}")
         return
  
-    if horas > 6:
-        estado_interno["energia_social"] = max(0.2, estado_interno["energia_social"] - 0.05)
-    elif horas > 2:
-        estado_interno["energia_social"] = min(1.0, estado_interno["energia_social"] + 0.03)
+    # Suavizado (sem corte exato em "6 horas"): recupera um pouco depois de
+    # uma pausa curta, cai gradualmente depois de uma pausa longa — sem um
+    # salto perceptível por cruzar um limiar exato de poucos minutos.
+    peso_pausa_curta = _suavizar_transicao(horas, centro=2, largura=1)
+    peso_pausa_longa = _suavizar_transicao(horas, centro=6, largura=1)
+    delta = peso_pausa_curta * 0.03 - peso_pausa_longa * 0.08
+    minimo, maximo = LIMITES_ESTADO["energia_social"]
+    estado_interno["energia_social"] = max(minimo, min(maximo, estado_interno["energia_social"] + delta))
  
  
 STOPWORDS_PT = {
@@ -2654,7 +2669,7 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, m
                 "content": contexto_extra
             })
  
-        for h in history[-8:]:
+        for h in history[-JANELA_HISTORICO_PROMPT:]:
             messages.append({"role": h["role"], "content": h["content"]})
  
         messages.append({"role": "user", "content": mensagem})
@@ -3324,11 +3339,6 @@ async def debug_definir_perfil(req: DebugPerfilRequest, sessao: SessionState = D
         }
  
  
- 
-if __name__ == "__main__":
-    import uvicorn
-    porta = int(os.getenv("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=porta, reload=bool(os.getenv("DEV_RELOAD")))
  
 if __name__ == "__main__":
     import uvicorn
