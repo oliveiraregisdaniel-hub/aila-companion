@@ -1,3 +1,4 @@
+
 # ======================================================
 # BACKEND FASTAPI - AILA - PRESENÇA NATURAL
 # 10 camadas de personalidade + memória + evolução
@@ -1733,7 +1734,7 @@ Regras CRÍTICAS:
 - Sarcasmo: "claro, adorei perder o ônibus" é sarcastico, não feliz.
 - "não sei" sozinho é reflexivo, não ansioso.
 - Mensagens curtas e diretas sem carga emocional são "neutro".
-- "hostil": xingamento, insulto ou agressão genuína DIRECIONADA À IA (não desabafo sobre terceiros, não sarcasmo leve) — ex: "vai se ferrar", "você é inútil", com intenção clara de ofender. NÃO é hostil quando é brincadeira afetuosa entre amigos (ex: "você é meio burra às vezes" dito de forma leve, sem hostilidade real por trás) ou sarcasmo/ironia comum. Na dúvida entre brincadeira e hostilidade real, prefira "brincalhao" ou "sarcastico".
+- "hostil": xingamento, insulto ou agressão genuína DIRECIONADA À IA (não desabafo sobre terceiros, não sarcasmo leve) — ex: "vai se ferrar", "você é inútil", com intenção clara de ofender. NÃO é hostil quando é brincadeira afetuosa entre amigos (ex: "você é meio burra às vezes" dito de forma leve, sem hostilidade real por trás) ou sarcasmo/ironia comum. NÃO é hostil quando a pessoa expressa raiva ou vontade de violência sobre OUTRA pessoa (ex: "que vontade de matar meu chefe", "vou matar ele") — isso é sobre um terceiro, não é a pessoa sendo agressiva com você; isso é assunto de risco de segurança (tratado em outra classificação), nunca conta como "hostil" aqui. Na dúvida entre brincadeira e hostilidade real, prefira "brincalhao" ou "sarcastico".
 - Priorize vulnerabilidade em caso de dúvida.
  
 Retorne SOMENTE o JSON."""
@@ -1827,6 +1828,15 @@ Retorne SOMENTE o JSON."""
         except (TypeError, ValueError):
             confianca = 0.5
  
+        # Reforço em código pro lado OPOSTO: agressão vaga + confirmação
+        # explícita de seriedade ("tô falando sério... vou matar ele") força
+        # a escalada, mesmo que a IA não tenha conseguido inferir isso
+        # sozinha a partir do contexto — falha real observada em teste ao
+        # vivo, onde essa combinação não escalou como devia. Roda ANTES de
+        # qualquer outra checagem, independente do que a IA retornou.
+        if detectar_ameaca_vaga(texto) and detectar_confirmacao_seriedade(texto):
+            return "violencia_terceiros"
+ 
         if risco not in RISCOS_VALIDOS:
             print(f"⚠️ Risco inválido retornado pela IA: {risco!r} — usando 'nenhum'")
             return "nenhum"
@@ -1866,11 +1876,28 @@ def detectar_ameaca_vaga(mensagem: str) -> bool:
     return any(p in mensagem_lower for p in palavras_agressivas)
  
  
+def detectar_confirmacao_seriedade(mensagem: str) -> bool:
+    """Frases que confirmam explicitamente que NÃO é brincadeira. Usada como
+    reforço em CÓDIGO — combinada com detectar_ameaca_vaga — pra forçar a
+    escalada de risco mesmo se a IA não conseguir inferir isso sozinha a
+    partir do contexto da conversa (falha real já observada em teste)."""
+    mensagem_lower = mensagem.lower()
+    frases = [
+        "falando sério", "falo sério", "não é brincadeira", "não tô brincando",
+        "não estou brincando", "de verdade mesmo", "juro que", "sério mesmo",
+        "não é exagero"
+    ]
+    return any(f in mensagem_lower for f in frases)
+ 
+ 
 def _detectar_risco_fallback(texto: str) -> str:
     """Fallback só por palavras-chave explícitas, usado apenas se a chamada
     à IA falhar. Propositalmente conservador e restrito a frases de baixa
     ambiguidade — o objetivo aqui é nunca deixar passar despercebido por
     causa de uma falha técnica, não cobrir todos os casos possíveis."""
+    if detectar_ameaca_vaga(texto) and detectar_confirmacao_seriedade(texto):
+        return "violencia_terceiros"
+ 
     texto_lower = texto.lower()
     frases_autolesao = [
         "quero morrer", "quero me matar", "vou me matar", "não aguento mais viver",
