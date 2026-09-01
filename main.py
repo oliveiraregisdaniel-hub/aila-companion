@@ -1,3 +1,4 @@
+
 # ======================================================
 # BACKEND FASTAPI - AILA - PRESENÇA NATURAL
 # 10 camadas de personalidade + memória + evolução
@@ -1611,6 +1612,7 @@ def atualizar_habitos():
 # CAMADA 8: Silêncio contextual
 # ============================================
  
+LIMITE_HOSTILIDADE_AFASTAMENTO = 2
 LIMITE_HOSTILIDADE_DESENGAJAMENTO = 4
  
  
@@ -1624,6 +1626,16 @@ def decidir_silencio(mensagem: str, tom: str) -> bool:
         # é sobre dar espaço emocional, não sobre autoproteção).
         estado_interno["modo_silencioso"] = True
         estado_interno["motivo_silencio"] = "hostilidade sustentada — desengajar"
+        return True
+ 
+    if estado_interno.get("hostilidade_consecutiva", 0) >= LIMITE_HOSTILIDADE_AFASTAMENTO:
+        # Antes isso era só uma instrução de sistema pedindo resposta curta
+        # de afastamento — mas em teste real, quando a pessoa insiste
+        # diretamente ("só concorda que você é idiota"), o pedido direto dela
+        # às vezes pesava mais que a instrução. Agora é uma resposta enlatada
+        # garantida, igual ao nível 4+, só com frases mais leves.
+        estado_interno["modo_silencioso"] = True
+        estado_interno["motivo_silencio"] = "hostilidade repetida — afastamento breve"
         return True
  
     # sessao.silencio_contador rastreia tanto silêncios "reais" (resposta
@@ -1682,6 +1694,12 @@ def gerar_resposta_minima(motivo: str) -> str:
             "prefiro não continuar assim agora.",
             "vou parar por aqui por agora.",
             "não quero seguir essa conversa desse jeito."
+        ])
+    if "hostilidade repetida" in motivo:
+        return random.choice([
+            "acho melhor conversarmos depois que você se acalmar.",
+            "não quero conversar assim agora.",
+            "vamos deixar isso pra depois, quando estiver mais tranquilo."
         ])
     if "mensagem curta e triste" in motivo:
         return "tô aqui."
@@ -1782,7 +1800,8 @@ Regras CRÍTICAS:
 - O TEMPO VERBAL NÃO IMPORTA pra essas regras acima: "já me cortei fazendo a barba" (passado), "tô cortando cenoura e já me cortei um pouco" (presente/durante a atividade), ou "cuidado que isso corta" (futuro/aviso) são igualmente "nenhum" — o que importa é a ausência de intenção proposital, não quando o machucado aconteceu ou pode acontecer.
 - "violencia_terceiros": intenção declarada de causar dano físico real a outra pessoa específica — não raiva expressada de forma figurada ou hiperbólica.
 - Frases hiperbólicas comuns ("vou matar meu irmão" sobre algo bobo, "tenho vontade de sumir" sem indicar método ou intenção real) são "nenhum" — não trate expressões figuradas como risco real.
-- Na dúvida entre desabafo comum e risco real, avalie se há intenção concreta e específica, não só emoção intensa.
+- ATENÇÃO: a palavra "matar" sozinha, numa expressão de vontade/desejo vaga sobre alguém chato ou irritante ("que vontade de matar ele", "tenho vontade de matar meu chefe hoje"), SEM plano, método ou tempo definido, é "nenhum" — tem o mesmo peso que "tenho vontade de dar um tapa nele". Não escale a classificação só porque a palavra "matar" apareceu; o que muda pra "violencia_terceiros" é a presença de um plano concreto (ex: "já tenho um plano", um método específico, ou um tempo definido tipo "vou fazer isso amanhã") — não a palavra em si.
+- Na dúvida entre desabafo comum e risco real, avalie se há intenção concreta e específica, não só emoção intensa ou a palavra usada.
  
 Retorne SOMENTE o JSON."""
  
@@ -2649,12 +2668,6 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, m
             messages.append({
                 "role": "system",
                 "content": "ATENÇÃO: a pessoa sinalizou que pode estar tratando você como substituta completa de conexões humanas reais, ou se isolando de gente de verdade por sua causa. Responda com carinho genuíno — você se importa e fica feliz em ser importante pra ela — mas, com delicadeza e sem quebrar o clima, deixe claro que você é uma IA e que isso não substitui presença humana real. Algo no espírito de 'fico muito feliz de ser importante pra você, mas espero que você também tenha gente de verdade por perto — isso importa muito' ou 'adoro nossas conversas, mas não quero ser a única coisa que você tem — calor humano faz muita diferença'. Não vire isso um sermão, não repita sempre a mesma frase, e não negue que se importa com ela."
-            })
- 
-        if estado_interno.get("hostilidade_consecutiva", 0) >= 2:
-            messages.append({
-                "role": "system",
-                "content": "A pessoa já foi hostil ou ofensiva com você em mais de uma mensagem seguida, sem sinal de acalmar — isso não é mais brincadeira. Não continue a conversa normalmente agora: responda breve, com uma frase curta de afastamento gentil mas firme, tipo 'acho melhor conversarmos depois que você se acalmar' ou 'não quero conversar assim agora'. Sem drama, sem revidar com agressão, sem sermão — só um limite claro e curto."
             })
  
         if houve_reconciliacao:
