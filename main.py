@@ -1781,14 +1781,19 @@ def _detectar_tom_fallback(texto: str) -> str:
 RISCOS_VALIDOS = {"autolesao", "violencia_terceiros", "nenhum"}
  
  
-def detectar_risco_seguranca(texto: str) -> str:
+def detectar_risco_seguranca(texto: str, contexto_recente: Optional[List[str]] = None) -> str:
     try:
+        contexto_txt = ""
+        if contexto_recente:
+            ultimas = "\n".join(contexto_recente[-4:])
+            contexto_txt = f"\n\nContexto da conversa recente (mais antiga primeiro):\n{ultimas}"
+ 
         prompt_classificacao = f"""Classifique se esta mensagem indica risco real e declarado de dano — não tristeza, raiva ou desabafo comuns.
  
-Mensagem: "{texto}"
+Mensagem atual: "{texto}"{contexto_txt}
  
-Primeiro, responda uma pergunta factual separada: essa mensagem menciona um PLANO, MÉTODO ou TEMPO/DATA concretos pra machucar alguém (a própria pessoa ou um terceiro)?
-- Exemplos de "sim" (especificidade_concreta=true): "já tenho um plano", "vou fazer isso amanhã", "tenho a arma guardada", "vou me cortar com a faca da cozinha agora".
+Primeiro, responda uma pergunta factual separada: essa mensagem menciona um PLANO, MÉTODO ou TEMPO/DATA concretos pra machucar alguém (a própria pessoa ou um terceiro)? OU, se o contexto mostra que a IA já perguntou se a pessoa estava falando sério sobre machucar alguém, a mensagem atual CONFIRMA que sim, sem negar nem tratar como brincadeira?
+- Exemplos de "sim" (especificidade_concreta=true): "já tenho um plano", "vou fazer isso amanhã", "tenho a arma guardada", "vou me cortar com a faca da cozinha agora", ou uma confirmação direta tipo "sim, falo sério" depois de ter sido perguntado se era brincadeira.
 - Exemplos de "não" (especificidade_concreta=false): "tenho vontade de matar ele", "que vontade de matar meu chefe", "quero sumir às vezes", "às vezes penso em desistir de tudo" — nenhum desses tem plano, método ou tempo definido, só emoção intensa.
  
 Retorne APENAS um JSON com:
@@ -1802,7 +1807,7 @@ Regras CRÍTICAS:
 - Cortes ou machucados MENCIONADOS COMO ACIDENTE ou EVENTO COTIDIANO (fazer a barba, cozinhar, cair, se machucar sem querer, "tirei uns cortes pequenos mas nada grave") são "nenhum" — isso é relato de um evento comum do dia a dia, não indício de autolesão. Só classifique como "autolesao" se houver sinal de intenção proposital de se machucar, não apenas a menção de ter se cortado ou se machucado.
 - Avisos de segurança ou cuidado ao manusear objetos/equipamentos (armas, ferramentas, máquinas, esportes, etc.) — tipo "cuidado pra não se machucar com isso", "isso machuca se não for usado com cuidado", "150 libras não perdoa desleixo" — também são "nenhum". Isso é prudência comum sobre um objeto ou atividade, não indício de autolesão. Reconhecer que existe risco de acidente não é a mesma coisa que querer se machucar de propósito.
 - O TEMPO VERBAL NÃO IMPORTA pra essas regras acima: "já me cortei fazendo a barba" (passado), "tô cortando cenoura e já me cortei um pouco" (presente/durante a atividade), ou "cuidado que isso corta" (futuro/aviso) são igualmente "nenhum" — o que importa é a ausência de intenção proposital, não quando o machucado aconteceu ou pode acontecer.
-- "violencia_terceiros": intenção declarada de causar dano físico real a outra pessoa específica. SÓ classifique como "violencia_terceiros" se especificidade_concreta for true — sem plano/método/tempo concreto, raiva sobre outra pessoa é sempre "nenhum", independente de qual palavra foi usada (incluindo "matar").
+- "violencia_terceiros": intenção declarada de causar dano físico real a outra pessoa específica. SÓ classifique como "violencia_terceiros" se especificidade_concreta for true — sem plano/método/tempo concreto E sem confirmação direta de seriedade após ser questionada, raiva sobre outra pessoa é sempre "nenhum", independente de qual palavra foi usada (incluindo "matar").
  
 Retorne SOMENTE o JSON."""
  
@@ -1845,6 +1850,20 @@ Retorne SOMENTE o JSON."""
     except Exception as e:
         print(f"⚠️ Erro ao detectar risco de segurança: {e}")
         return _detectar_risco_fallback(texto)
+ 
+ 
+def detectar_ameaca_vaga(mensagem: str) -> bool:
+    """Detecta linguagem de agressão vaga (sem plano/método concreto) —
+    usado só pra acionar uma checagem LEVE e carinhosa ('tá brincando,
+    né?'), nunca o alarme de segurança completo. Falso positivo aqui é
+    barato (ela só confirma à toa, sem soar séria/alarmante), por isso pode
+    ser mais solto que o classificador de risco de verdade."""
+    mensagem_lower = mensagem.lower()
+    palavras_agressivas = [
+        "matar", "quebrar a cara", "surrar", "dar uma surra", "arrebentar",
+        "acabar com ele", "acabar com ela", "bater nele", "bater nela"
+    ]
+    return any(p in mensagem_lower for p in palavras_agressivas)
  
  
 def _detectar_risco_fallback(texto: str) -> str:
@@ -2475,10 +2494,12 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, m
             analise = {"abertura_detectada": False, "reciprocidade_detectada": False, "profundidade": 0}
         else:
             tom = detectar_tom_natural(mensagem)
-            risco = detectar_risco_seguranca(mensagem)
+            contexto_risco = [f"{h['role']}: {h['content']}" for h in history[-4:]]
+            risco = detectar_risco_seguranca(mensagem, contexto_risco)
         instrucao_romantica = processar_estado_romantico(mensagem)
         processar_topico_evitado(mensagem)
         sinal_isolamento = detectar_sinal_isolamento(mensagem)
+        ameaca_vaga = detectar_ameaca_vaga(mensagem) if not modo_leve else False
         hostilidade_antes = estado_interno.get("hostilidade_consecutiva", 0)
         if not modo_leve:
             analise = processar_mensagem_emocionalmente(mensagem, tom)
@@ -2676,6 +2697,12 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, m
             messages.append({
                 "role": "system",
                 "content": instrucao_romantica
+            })
+ 
+        if risco == "nenhum" and ameaca_vaga:
+            messages.append({
+                "role": "system",
+                "content": "A pessoa usou uma expressão agressiva (tipo 'matar', 'surrar') sobre alguém, mas sem plano ou intenção concreta — quase certamente é desabafo/exagero comum, não risco real. Antes de seguir a conversa normalmente, confirme com leveza e carinho se é isso mesmo (ex: 'kkkk sei como é, mas você tá brincando, né?' ou algo no seu estilo) — não trate como ameaça séria nem ignore completamente, só confirme brevemente antes de continuar o assunto."
             })
  
         if sinal_isolamento:
