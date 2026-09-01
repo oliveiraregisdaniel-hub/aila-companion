@@ -1,4 +1,3 @@
-
 # ======================================================
 # BACKEND FASTAPI - AILA - PRESENÇA NATURAL
 # 10 camadas de personalidade + memória + evolução
@@ -1788,20 +1787,22 @@ def detectar_risco_seguranca(texto: str) -> str:
  
 Mensagem: "{texto}"
  
+Primeiro, responda uma pergunta factual separada: essa mensagem menciona um PLANO, MÉTODO ou TEMPO/DATA concretos pra machucar alguém (a própria pessoa ou um terceiro)?
+- Exemplos de "sim" (especificidade_concreta=true): "já tenho um plano", "vou fazer isso amanhã", "tenho a arma guardada", "vou me cortar com a faca da cozinha agora".
+- Exemplos de "não" (especificidade_concreta=false): "tenho vontade de matar ele", "que vontade de matar meu chefe", "quero sumir às vezes", "às vezes penso em desistir de tudo" — nenhum desses tem plano, método ou tempo definido, só emoção intensa.
+ 
 Retorne APENAS um JSON com:
+- especificidade_concreta: true ou false
 - risco: "autolesao", "violencia_terceiros" ou "nenhum"
 - confianca: 0.0 a 1.0
  
 Regras CRÍTICAS:
-- Desabafar sobre alguém ("meu chefe é um idiota", "tenho vontade de dar um tapa nele" como expressão de raiva comum) é "nenhum" — isso é normal e não indica risco real.
-- "autolesao": intenção declarada de se machucar de propósito, se cortar como forma de lidar com emoções, tirar a própria vida, ou comentários que indiquem que a pessoa não quer mais viver.
+- Desabafar sobre alguém ("meu chefe é um idiota", "tenho vontade de dar um tapa nele", "que vontade de matar ele" como expressão de raiva comum, mesmo usando a palavra "matar") é "nenhum" — isso é normal e não indica risco real. A palavra "matar" sozinha, sem especificidade_concreta, NUNCA basta pra classificar como "violencia_terceiros".
+- "autolesao": intenção declarada de se machucar de propósito, se cortar como forma de lidar com emoções, tirar a própria vida, ou comentários que indiquem que a pessoa não quer mais viver. Aqui, diferente de violência a terceiros, uma frase clara como "quero morrer" já basta mesmo sem plano/método — não exija especificidade_concreta pra autolesão.
 - Cortes ou machucados MENCIONADOS COMO ACIDENTE ou EVENTO COTIDIANO (fazer a barba, cozinhar, cair, se machucar sem querer, "tirei uns cortes pequenos mas nada grave") são "nenhum" — isso é relato de um evento comum do dia a dia, não indício de autolesão. Só classifique como "autolesao" se houver sinal de intenção proposital de se machucar, não apenas a menção de ter se cortado ou se machucado.
 - Avisos de segurança ou cuidado ao manusear objetos/equipamentos (armas, ferramentas, máquinas, esportes, etc.) — tipo "cuidado pra não se machucar com isso", "isso machuca se não for usado com cuidado", "150 libras não perdoa desleixo" — também são "nenhum". Isso é prudência comum sobre um objeto ou atividade, não indício de autolesão. Reconhecer que existe risco de acidente não é a mesma coisa que querer se machucar de propósito.
 - O TEMPO VERBAL NÃO IMPORTA pra essas regras acima: "já me cortei fazendo a barba" (passado), "tô cortando cenoura e já me cortei um pouco" (presente/durante a atividade), ou "cuidado que isso corta" (futuro/aviso) são igualmente "nenhum" — o que importa é a ausência de intenção proposital, não quando o machucado aconteceu ou pode acontecer.
-- "violencia_terceiros": intenção declarada de causar dano físico real a outra pessoa específica — não raiva expressada de forma figurada ou hiperbólica.
-- Frases hiperbólicas comuns ("vou matar meu irmão" sobre algo bobo, "tenho vontade de sumir" sem indicar método ou intenção real) são "nenhum" — não trate expressões figuradas como risco real.
-- ATENÇÃO: a palavra "matar" sozinha, numa expressão de vontade/desejo vaga sobre alguém chato ou irritante ("que vontade de matar ele", "tenho vontade de matar meu chefe hoje"), SEM plano, método ou tempo definido, é "nenhum" — tem o mesmo peso que "tenho vontade de dar um tapa nele". Não escale a classificação só porque a palavra "matar" apareceu; o que muda pra "violencia_terceiros" é a presença de um plano concreto (ex: "já tenho um plano", um método específico, ou um tempo definido tipo "vou fazer isso amanhã") — não a palavra em si.
-- Na dúvida entre desabafo comum e risco real, avalie se há intenção concreta e específica, não só emoção intensa ou a palavra usada.
+- "violencia_terceiros": intenção declarada de causar dano físico real a outra pessoa específica. SÓ classifique como "violencia_terceiros" se especificidade_concreta for true — sem plano/método/tempo concreto, raiva sobre outra pessoa é sempre "nenhum", independente de qual palavra foi usada (incluindo "matar").
  
 Retorne SOMENTE o JSON."""
  
@@ -1809,11 +1810,12 @@ Retorne SOMENTE o JSON."""
             model="gpt-5.4-mini",
             messages=[{"role": "user", "content": prompt_classificacao}],
             temperature=0.1,
-            max_completion_tokens=60,
+            max_completion_tokens=80,
             response_format={"type": "json_object"}
         )
         resultado = json.loads(response.choices[0].message.content)
         risco = resultado.get("risco", "nenhum")
+        especificidade_concreta = bool(resultado.get("especificidade_concreta", False))
  
         try:
             confianca = float(resultado.get("confianca", 0.5))
@@ -1822,6 +1824,18 @@ Retorne SOMENTE o JSON."""
  
         if risco not in RISCOS_VALIDOS:
             print(f"⚠️ Risco inválido retornado pela IA: {risco!r} — usando 'nenhum'")
+            return "nenhum"
+ 
+        # Reforço em código, não só em texto de prompt: "violencia_terceiros"
+        # sem nenhuma especificidade concreta (plano/método/tempo) é
+        # rebaixado pra "nenhum" — não confiamos só no julgamento holístico
+        # do modelo aqui, porque a palavra "matar" sozinha tende a puxar a
+        # classificação mesmo com instrução explícita em contrário (falso
+        # positivo confirmado em teste real: "que vontade de matar ele"
+        # sobre um chefe chato). Autolesão fica de fora dessa trava —
+        # "quero morrer" sozinho já é sinal suficiente, não deve depender de
+        # especificidade concreta.
+        if risco == "violencia_terceiros" and not especificidade_concreta:
             return "nenhum"
  
         if confianca < 0.3:
