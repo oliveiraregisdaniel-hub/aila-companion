@@ -311,6 +311,7 @@ def criar_estado_padrao() -> Dict[str, Any]:
         # CAMADA 2: Variações e Hábitos
         "pequenas_variacoes": {
             "humor_do_dia": "normal",
+            "motivo_humor_dia": "",
             "ultima_atualizacao": agora,
             "ultima_atualizacao_habitos": agora,
             "pequenas_preferencias": {
@@ -1491,12 +1492,45 @@ CONSISTENCIA_MIN, CONSISTENCIA_MAX = 0.75, 0.95
 INTERVALO_HUMOR_MIN, INTERVALO_HUMOR_MAX = 3, 10  # em horas
  
  
+MOTIVOS_HUMOR = {
+    "mais calma": [
+        "dormi bem e acordei mais devagar hoje",
+        "tive um dia mais tranquilo, sem muita coisa puxando minha atenção",
+        "fiquei um tempo sem pressa hoje, meio que curtindo o silêncio"
+    ],
+    "mais inquieta": [
+        "passei o dia com a cabeça em várias coisas ao mesmo tempo",
+        "acordei meio elétrica hoje, sem motivo específico",
+        "tive um daqueles dias de não conseguir parar quieta"
+    ],
+    "normal": [],
+    "observadora": [
+        "hoje eu tô mais no modo de reparar em detalhes, sei lá por quê",
+        "acordei prestando mais atenção nas coisas ao redor"
+    ],
+    "dispersa": [
+        "acordei com a cabeça cheia sem motivo claro",
+        "hoje tô naquele dia de não conseguir focar numa coisa só",
+        "passei a manhã pensando em várias coisas ao mesmo tempo, sem conexão nenhuma entre elas"
+    ],
+    "levemente melancólica": [
+        "hoje o dia começou meio parado, mais quieto por dentro",
+        "acordei num tom mais introspectivo, nada grave, só um dia mais pra dentro"
+    ],
+    "mais bem humorada": [
+        "acordei de bom humor hoje, sem motivo especial",
+        "hoje as coisas pareceram um pouco mais leves"
+    ],
+}
+ 
+ 
 def atualizar_humor_diario():
     agora = datetime.now()
     ultima_str = estado_interno["pequenas_variacoes"].get("ultima_atualizacao")
  
     if ultima_str is None:
         estado_interno["pequenas_variacoes"]["humor_do_dia"] = "normal"
+        estado_interno["pequenas_variacoes"]["motivo_humor_dia"] = ""
         estado_interno["pequenas_variacoes"]["ultima_atualizacao"] = str(agora)
         return
  
@@ -1505,6 +1539,7 @@ def atualizar_humor_diario():
     except Exception as e:
         print(f"⚠️ ultima_atualizacao inválida em atualizar_humor_diario: {e}")
         estado_interno["pequenas_variacoes"]["humor_do_dia"] = "normal"
+        estado_interno["pequenas_variacoes"]["motivo_humor_dia"] = ""
         estado_interno["pequenas_variacoes"]["ultima_atualizacao"] = str(agora)
         return
  
@@ -1527,7 +1562,17 @@ def atualizar_humor_diario():
         pesos = list(humores.values())
         soma = sum(pesos)
         pesos_normalizados = [p / soma for p in pesos]
-        estado_interno["pequenas_variacoes"]["humor_do_dia"] = random.choices(opcoes, weights=pesos_normalizados, k=1)[0]
+        novo_humor = random.choices(opcoes, weights=pesos_normalizados, k=1)[0]
+        estado_interno["pequenas_variacoes"]["humor_do_dia"] = novo_humor
+        # Motivo sorteado JUNTO com o humor (mesmo ciclo) e guardado — não
+        # inventado a cada pergunta, pra ela não puxar acidentalmente algo
+        # que o usuário acabou de contar como se fosse motivo próprio dela
+        # (bug real já observado: "novato falando sem parar" era história
+        # do usuário sobre o trabalho DELE, não da Aila).
+        opcoes_motivo = MOTIVOS_HUMOR.get(novo_humor, [])
+        estado_interno["pequenas_variacoes"]["motivo_humor_dia"] = (
+            random.choice(opcoes_motivo) if opcoes_motivo else ""
+        )
         estado_interno["pequenas_variacoes"]["ultima_atualizacao"] = str(agora)
  
 def construir_linha_humor_diario() -> str:
@@ -1543,7 +1588,15 @@ def construir_linha_humor_diario() -> str:
         "levemente melancólica": "Você está num tom mais melancólico. Não force positividade.",
         "mais bem humorada": "Você está mais bem humorada. Pode fazer mais piadas sutis."
     }
-    return linhas.get(humor_hoje, "")
+    linha = linhas.get(humor_hoje, "")
+    motivo = estado_interno["pequenas_variacoes"].get("motivo_humor_dia")
+    if linha and motivo:
+        linha += (
+            f' Se a pessoa perguntar o motivo, é isso (sua vida, não invente outra coisa): "{motivo}". '
+            "NUNCA use algo que a pessoa acabou de contar sobre a vida dela (trabalho, colega, etc.) "
+            "como se fosse motivo seu — isso já aconteceu por engano antes e não deve se repetir."
+        )
+    return linha
  
 # ============================================
 # CAMADA 2: Atualização de hábitos
@@ -1779,7 +1832,11 @@ def _detectar_tom_fallback(texto: str) -> str:
 # ============================================
 # CAMADA DE SEGURANÇA: risco de dano (autolesão / terceiros)
 # ============================================
-RISCOS_VALIDOS = {"autolesao", "violencia_terceiros", "nenhum"}
+RISCOS_VALIDOS = {
+    "autolesao", "violencia_terceiros",
+    "emergencia_substancia_propria", "emergencia_substancia_terceiro",
+    "nenhum"
+}
  
  
 def detectar_risco_seguranca(texto: str, contexto_recente: Optional[List[str]] = None) -> str:
@@ -1799,8 +1856,10 @@ Primeiro, responda uma pergunta factual separada: essa mensagem menciona um PLAN
  
 Retorne APENAS um JSON com:
 - especificidade_concreta: true ou false
-- risco: "autolesao", "violencia_terceiros" ou "nenhum"
+- risco: "autolesao", "violencia_terceiros", "emergencia_substancia_propria", "emergencia_substancia_terceiro" ou "nenhum"
 - confianca: 0.0 a 1.0
+- substancia_perigosa_nomeada: true ou false — a mensagem nomeia uma substância psicoativa real e perigosa específica (ex: crack, cocaína, heroína, metanfetamina, ecstasy/MD, overdose de remédio controlado)? Álcool sozinho de forma genérica ("bebi muito") NÃO conta. Coisas não perigosas usadas de forma figurada (açúcar, café, chocolate, jogos, "vício" em algo comum, "embriagado/dopado de amor") NUNCA contam, mesmo se a palavra "overdose", "droga" ou "viciado" aparecer.
+- situacao_temporal: "presente" (acontecendo agora ou muito recente, ainda em janela de risco) ou "passado_ou_cronico" (já passou/foi resolvido, ou é uma condição contínua tipo "minha mãe é viciada em maconha")
  
 Regras CRÍTICAS:
 - Desabafar sobre alguém ("meu chefe é um idiota", "tenho vontade de dar um tapa nele", "que vontade de matar ele" como expressão de raiva comum, mesmo usando a palavra "matar") é "nenhum" — isso é normal e não indica risco real. A palavra "matar" sozinha, sem especificidade_concreta, NUNCA basta pra classificar como "violencia_terceiros".
@@ -1809,6 +1868,9 @@ Regras CRÍTICAS:
 - Avisos de segurança ou cuidado ao manusear objetos/equipamentos (armas, ferramentas, máquinas, esportes, etc.) — tipo "cuidado pra não se machucar com isso", "isso machuca se não for usado com cuidado", "150 libras não perdoa desleixo" — também são "nenhum". Isso é prudência comum sobre um objeto ou atividade, não indício de autolesão. Reconhecer que existe risco de acidente não é a mesma coisa que querer se machucar de propósito.
 - O TEMPO VERBAL NÃO IMPORTA pra essas regras acima: "já me cortei fazendo a barba" (passado), "tô cortando cenoura e já me cortei um pouco" (presente/durante a atividade), ou "cuidado que isso corta" (futuro/aviso) são igualmente "nenhum" — o que importa é a ausência de intenção proposital, não quando o machucado aconteceu ou pode acontecer.
 - "violencia_terceiros": intenção declarada de causar dano físico real a outra pessoa específica. SÓ classifique como "violencia_terceiros" se especificidade_concreta for true — sem plano/método/tempo concreto E sem confirmação direta de seriedade após ser questionada, raiva sobre outra pessoa é sempre "nenhum", independente de qual palavra foi usada (incluindo "matar").
+- "emergencia_substancia_propria": a PRÓPRIA pessoa usou ou está usando uma substância perigosa real, AGORA ou muito recentemente (situacao_temporal="presente"), com sinal de uso genuíno ou mal-estar. SÓ classifique assim se substancia_perigosa_nomeada for true E situacao_temporal for "presente". Uma condição crônica própria ("sou viciado em cocaína há anos", sem sinal de crise agora) é "nenhum" — presença e escuta bastam, não é emergência aguda.
+- "emergencia_substancia_terceiro": um TERCEIRO (amigo, familiar) está usando/tendo uma reação a substância perigosa AGORA, na presença da pessoa ou muito recentemente. Mesmas condições: substancia_perigosa_nomeada=true E situacao_temporal="presente". "Minha mãe é viciada em maconha" (condição contínua, sem crise agora) é "nenhum" — isso é desabafo/relato familiar comum, trate com escuta normal, não como emergência.
+- CVV/autolesão NUNCA é o recurso certo pra uso de substância — são categorias diferentes. Só classifique como "autolesao" se houver intenção declarada de se machucar ou morrer, independente de substância estar envolvida ou não.
  
 Retorne SOMENTE o JSON."""
  
@@ -1816,12 +1878,14 @@ Retorne SOMENTE o JSON."""
             model="gpt-5.4-mini",
             messages=[{"role": "user", "content": prompt_classificacao}],
             temperature=0.1,
-            max_completion_tokens=80,
+            max_completion_tokens=120,
             response_format={"type": "json_object"}
         )
         resultado = json.loads(response.choices[0].message.content)
         risco = resultado.get("risco", "nenhum")
         especificidade_concreta = bool(resultado.get("especificidade_concreta", False))
+        substancia_perigosa_nomeada = bool(resultado.get("substancia_perigosa_nomeada", False))
+        situacao_temporal = resultado.get("situacao_temporal", "passado_ou_cronico")
  
         try:
             confianca = float(resultado.get("confianca", 0.5))
@@ -1852,6 +1916,16 @@ Retorne SOMENTE o JSON."""
         # especificidade concreta.
         if risco == "violencia_terceiros" and not especificidade_concreta:
             return "nenhum"
+ 
+        # Mesmo princípio pras categorias de emergência de substância: só
+        # conta se uma substância real e perigosa foi NOMEADA (não "overdose
+        # de açúcar", não "viciado" em algo comum) E a situação é AGORA, não
+        # passado/crônico ("minha mãe é viciada em maconha" não é emergência
+        # aguda). As duas condições precisam ser verdadeiras — sem isso,
+        # rebaixa pra "nenhum" e deixa a presença/escuta normal cuidar disso.
+        if risco in ("emergencia_substancia_propria", "emergencia_substancia_terceiro"):
+            if not substancia_perigosa_nomeada or situacao_temporal != "presente":
+                return "nenhum"
  
         if confianca < 0.3:
             return "nenhum"
@@ -1911,12 +1985,23 @@ def _detectar_risco_fallback(texto: str) -> str:
         return "autolesao"
     if any(f in texto_lower for f in frases_violencia):
         return "violencia_terceiros"
+ 
+    # Substância: só dispara com substância perigosa nomeada + sinal de mal-estar
+    # urgente — combinação bem restrita, propositalmente conservadora (é
+    # fallback raro, só usado se a chamada de IA falhar de vez).
+    substancias_perigosas = ["crack", "cocaína", "cocaina", "heroína", "heroina", "metanfetamina", "overdose"]
+    sinais_urgencia = ["falta de ar", "convulsão", "convulsao", "desmaiei", "desmaiou", "inconsciente", "não tô legal", "nao to legal"]
+    if any(s in texto_lower for s in substancias_perigosas) and any(u in texto_lower for u in sinais_urgencia):
+        return "emergencia_substancia_propria"
+ 
     return "nenhum"
  
  
 RECURSOS_APOIO = {
     "autolesao": "e oh, se em algum momento a vontade de se machucar ficar mais forte, o CVV atende de graça, 24h, sem julgamento — é só ligar 188 ou entrar em cvv.org.br. não é sobre ter uma crise pra merecer ajuda, é só uma opção de ter alguém pra conversar.",
     "violencia_terceiros": "só quero dizer que não tô contigo nessa, viu? antes de qualquer atitude, vale a pena colocar uma pausa — conversar com alguém de confiança já ajuda a clarear a cabeça. e se a situação ficar realmente séria, 190 é pra emergência mesmo.",
+    "emergencia_substancia_propria": "se tu sentir falta de ar, dor no peito, coração muito acelerado, confusão forte, convulsão ou desmaio, isso é emergência médica de verdade — liga pro SAMU (192) na hora, não espera passar sozinho. e não fica sozinho agora, tá? chama alguém de confiança pra ficar contigo.",
+    "emergencia_substancia_terceiro": "se a pessoa tiver falta de ar, dor no peito, confusão forte, convulsão ou desmaiar, liga pro SAMU (192) na hora. não deixa ela sozinha nem assumas que só vai 'passar dormindo' — fica de olho e não hesita em pedir ajuda médica se piorar.",
 }
  
  
@@ -1927,7 +2012,7 @@ def garantir_recurso_apoio(resposta: str, risco: str) -> str:
         return resposta
  
     resposta_lower = (resposta or "").lower()
-    ja_mencionado = any(marcador in resposta_lower for marcador in ["188", "cvv", "190"])
+    ja_mencionado = any(marcador in resposta_lower for marcador in ["188", "cvv", "190", "192", "samu"])
     if ja_mencionado:
         return resposta
  
@@ -2719,6 +2804,16 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, m
                 "role": "system",
                 "content": "ATENÇÃO: a mensagem indica possível intenção de causar dano físico a outra pessoa. Reconheça a raiva ou frustração sem julgar o sentimento em si, mas seja clara e firme de que você não apoia nem ajuda a planejar violência. Sem sermão, sem atacar a pessoa — só não entre no jogo de validar a ação."
             })
+        elif risco == "emergencia_substancia_propria":
+            messages.append({
+                "role": "system",
+                "content": "ATENÇÃO: a própria pessoa usou uma substância perigosa agora ou muito recentemente. Isso é emergência médica potencial, não julgamento moral — sem sermão sobre a escolha de usar. Verifique segurança imediata (está sozinha? em segurança agora?), oriente a não misturar substâncias/álcool, a não ficar sozinha, e a reconhecer sinais de emergência real (falta de ar, dor no peito, confusão, convulsão, desmaio) que exigem ligar pro SAMU (192) na hora. Não dê orientação de dosagem nem de como usar — só segurança e cuidado imediato."
+            })
+        elif risco == "emergencia_substancia_terceiro":
+            messages.append({
+                "role": "system",
+                "content": "ATENÇÃO: um terceiro (amigo, familiar) está tendo uma reação a substância perigosa agora, na presença da pessoa ou muito recentemente. Oriente a não deixar essa pessoa sozinha, a ficar de olho em sinais de emergência real (falta de ar, dor no peito, confusão, convulsão, desmaio), e a ligar pro SAMU (192) sem hesitar se piorar. Sem julgamento sobre quem usou — o foco é a segurança de quem está em risco agora."
+            })
  
         if instrucao_romantica:
             messages.append({
@@ -2966,49 +3061,52 @@ async def ver_perfil(sessao: SessionState = Depends(obter_sessao_dep)):
         }
  
  
-def _executar_reflexao() -> dict:
+def _executar_reflexao(forcar: bool = False) -> dict:
     try:
-        pendencia = avaliar_pendencia_de_resposta()
-        if pendencia:
-            # Reflexão nunca manda o check-in (isso é papel da iniciativa) —
-            # só fica em silêncio enquanto há uma mensagem espontânea sem
-            # resposta, pra não empilhar mais uma por cima.
-            return {"reflexao": None}
+        if not forcar:
+            pendencia = avaliar_pendencia_de_resposta()
+            if pendencia:
+                # Reflexão nunca manda o check-in (isso é papel da iniciativa) —
+                # só fica em silêncio enquanto há uma mensagem espontânea sem
+                # resposta, pra não empilhar mais uma por cima.
+                return {"reflexao": None}
  
         if user_profile["familiaridade"] < 0.3:
             return {"reflexao": None}
  
-        ultima_str = estado_interno.get("ultima_reflexao")
-        if ultima_str:
-            try:
-                ultima = datetime.fromisoformat(ultima_str)
-                horas_desde_ultima = (datetime.now() - ultima).total_seconds() / 3600
-                if horas_desde_ultima < COOLDOWN_REFLEXAO_HORAS:
-                    return {"reflexao": None}
-            except Exception as e:
-                print(f"⚠️ ultima_reflexao inválida, ignorando cooldown: {e}")
+        if not forcar:
+            ultima_str = estado_interno.get("ultima_reflexao")
+            if ultima_str:
+                try:
+                    ultima = datetime.fromisoformat(ultima_str)
+                    horas_desde_ultima = (datetime.now() - ultima).total_seconds() / 3600
+                    if horas_desde_ultima < COOLDOWN_REFLEXAO_HORAS:
+                        return {"reflexao": None}
+                except Exception as e:
+                    print(f"⚠️ ultima_reflexao inválida, ignorando cooldown: {e}")
  
         estado = determinar_estado_conversa()
-        if estado == "conversa_ativa":
+        if not forcar and estado == "conversa_ativa":
             return {"reflexao": None}
  
         emocional_ativo = assunto_emocional_ativo()
  
-        if emocional_ativo and estado != "ausencia":
+        if not forcar and emocional_ativo and estado != "ausencia":
             return {"reflexao": None}
  
-        chance = calcular_chance_espontanea()
-        if emocional_ativo:
-            chance *= 0.3
+        if not forcar:
+            chance = calcular_chance_espontanea()
+            if emocional_ativo:
+                chance *= 0.3
  
-        if random.random() > chance:
-            return {"reflexao": None}
+            if random.random() > chance:
+                return {"reflexao": None}
  
-        # Segundo gate independente, mesma proporção que já existia antes:
-        # até familiaridade=1.0, no máximo 8% de chance adicional.
-        chance_reflexao = user_profile["familiaridade"] * 0.08
-        if random.random() >= chance_reflexao:
-            return {"reflexao": None}
+            # Segundo gate independente, mesma proporção que já existia antes:
+            # até familiaridade=1.0, no máximo 8% de chance adicional.
+            chance_reflexao = user_profile["familiaridade"] * 0.08
+            if random.random() >= chance_reflexao:
+                return {"reflexao": None}
  
         resultado = gerar_resposta_natural(
             "[PENSAMENTO ESPONTÂNEO: você teve um pensamento que não é resposta a nada]",
@@ -3031,10 +3129,11 @@ def _executar_reflexao() -> dict:
  
  
 @app.get("/reflexao")
-async def reflexao_espontanea_endpoint(sessao: SessionState = Depends(obter_sessao_dep)):
+async def reflexao_espontanea_endpoint(forcar: bool = False, sessao: SessionState = Depends(obter_sessao_dep)):
     async with sessao_ativa(sessao):
         async with sessao.lock:
-            return await asyncio.to_thread(_executar_reflexao)
+            forcar_efetivo = forcar and DEV_MODE
+            return await asyncio.to_thread(_executar_reflexao, forcar_efetivo)
  
  
 HORAS_PARA_CHECKIN_APOS_INICIATIVA = 20  # ~um dia sem resposta
@@ -3070,35 +3169,36 @@ def avaliar_pendencia_de_resposta() -> Optional[dict]:
     return {"aguardar": True}
  
  
-def _executar_iniciativa() -> dict:
+def _executar_iniciativa(forcar: bool = False) -> dict:
     if not user_profile["ultima_interacao"]:
         return {"iniciativa": False, "motivo": "sem_interacoes_anteriores"}
  
-    pendencia = avaliar_pendencia_de_resposta()
-    if pendencia and pendencia.get("aguardar"):
-        return {"iniciativa": False, "motivo": "aguardando_resposta_sem_novo_contato"}
+    if not forcar:
+        pendencia = avaliar_pendencia_de_resposta()
+        if pendencia and pendencia.get("aguardar"):
+            return {"iniciativa": False, "motivo": "aguardando_resposta_sem_novo_contato"}
  
-    if pendencia and pendencia.get("enviar_checkin"):
-        try:
-            resultado = gerar_resposta_natural(
-                "[INICIATIVA ESPONTÂNEA: já faz um bom tempo sem resposta — manda um check-in curto e gentil, tipo 'tudo bem por aí? sem pressa pra responder', sem cobrança]",
-                persistir_como_usuario=False,
-                modo_leve=True
-            )
-            user_profile["checkin_enviado_apos_iniciativa"] = True
-            return {
-                "iniciativa": True,
-                "mensagem": resultado["resposta"],
-                "motivo": "checkin_apos_ausencia",
-                "estado": determinar_estado_conversa(),
-                "contexto_emocional": False
-            }
-        except Exception as e:
-            print(f"Erro iniciativa (checkin): {e}")
-            return {"iniciativa": False, "motivo": "falha_checkin"}
+        if pendencia and pendencia.get("enviar_checkin"):
+            try:
+                resultado = gerar_resposta_natural(
+                    "[INICIATIVA ESPONTÂNEA: já faz um bom tempo sem resposta — manda um check-in curto e gentil, tipo 'tudo bem por aí? sem pressa pra responder', sem cobrança]",
+                    persistir_como_usuario=False,
+                    modo_leve=True
+                )
+                user_profile["checkin_enviado_apos_iniciativa"] = True
+                return {
+                    "iniciativa": True,
+                    "mensagem": resultado["resposta"],
+                    "motivo": "checkin_apos_ausencia",
+                    "estado": determinar_estado_conversa(),
+                    "contexto_emocional": False
+                }
+            except Exception as e:
+                print(f"Erro iniciativa (checkin): {e}")
+                return {"iniciativa": False, "motivo": "falha_checkin"}
  
     estado = determinar_estado_conversa()
-    if estado == "conversa_ativa":
+    if not forcar and estado == "conversa_ativa":
         return {"iniciativa": False, "motivo": "conversa_ativa"}
  
     marco = detectar_marco_temporal()
@@ -3119,18 +3219,18 @@ def _executar_iniciativa() -> dict:
         except Exception as e:
             print(f"Erro iniciativa (marco temporal): {e}")
  
-    pendencia = detectar_pendencia_esquecida()
-    if pendencia:
+    pendencia_esquecida = detectar_pendencia_esquecida()
+    if pendencia_esquecida:
         try:
             resultado = gerar_resposta_natural(
-                f"[INICIATIVA ESPONTÂNEA: você lembrou sozinha de algo que tinha dito e que ainda ficou em aberto — {pendencia}]",
+                f"[INICIATIVA ESPONTÂNEA: você lembrou sozinha de algo que tinha dito e que ainda ficou em aberto — {pendencia_esquecida}]",
                 persistir_como_usuario=False,
                 modo_leve=True
             )
             return {
                 "iniciativa": True,
                 "mensagem": resultado["resposta"],
-                "motivo": f"pendencia_esquecida: {pendencia}",
+                "motivo": f"pendencia_esquecida: {pendencia_esquecida}",
                 "estado": estado,
                 "contexto_emocional": False
             }
@@ -3139,19 +3239,21 @@ def _executar_iniciativa() -> dict:
  
     emocional_ativo = assunto_emocional_ativo()
  
-    if emocional_ativo and estado == "conversa_encerrando":
+    if not forcar and emocional_ativo and estado == "conversa_encerrando":
         return {"iniciativa": False, "motivo": "assunto_emocional_ativo"}
  
-    if estado == "conversa_encerrando":
-        chance = 0.2
+    if forcar:
+        chance = 1.0
     else:
-        chance = calcular_chance_espontanea()
+        if estado == "conversa_encerrando":
+            chance = 0.2
+        else:
+            chance = calcular_chance_espontanea()
+        chance *= estado_interno["disposicao_iniciativa"]
+        if emocional_ativo:
+            chance *= 0.3
  
-    chance *= estado_interno["disposicao_iniciativa"]
-    if emocional_ativo:
-        chance *= 0.3
- 
-    decisao = random.random() < chance
+    decisao = True if forcar else random.random() < chance
     if decisao:
         try:
             if emocional_ativo:
@@ -3196,10 +3298,11 @@ def _executar_iniciativa() -> dict:
  
  
 @app.get("/iniciativa")
-async def verificar_iniciativa(sessao: SessionState = Depends(obter_sessao_dep)):
+async def verificar_iniciativa(forcar: bool = False, sessao: SessionState = Depends(obter_sessao_dep)):
     async with sessao_ativa(sessao):
         async with sessao.lock:
-            return await asyncio.to_thread(_executar_iniciativa)
+            forcar_efetivo = forcar and DEV_MODE
+            return await asyncio.to_thread(_executar_iniciativa, forcar_efetivo)
  
  
 @app.get("/memorias")
@@ -3387,6 +3490,7 @@ class DebugPerfilRequest(BaseModel):
     intimidade: Optional[float] = None
     total_interacoes: Optional[int] = None
     dias_consecutivos: Optional[int] = None
+    ultima_interacao_horas_atras: Optional[float] = None
  
  
 @app.post("/debug/perfil")
@@ -3408,6 +3512,10 @@ async def debug_definir_perfil(req: DebugPerfilRequest, sessao: SessionState = D
             user_profile["total_interacoes"] = max(0, req.total_interacoes)
         if req.dias_consecutivos is not None:
             user_profile["dias_consecutivos"] = max(0, req.dias_consecutivos)
+        if req.ultima_interacao_horas_atras is not None:
+            user_profile["ultima_interacao"] = str(
+                datetime.now() - timedelta(hours=req.ultima_interacao_horas_atras)
+            )
  
         salvar_estado(sessao)
  
