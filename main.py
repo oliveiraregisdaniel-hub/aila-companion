@@ -111,6 +111,9 @@ MIN_TAMANHO_MENSAGEM_MEMORIA_LP = 15  # abaixo disso, não vale a pena gastar um
 MAX_MEMORIAS_TOTAL_PROMPT = 6  # teto geral de linhas de memória (longo prazo + emocional) injetadas numa única resposta
 DIAS_EXPIRAR_PENDENTE = 30  # evento/recomendação/promessa pendente por mais que isso para de ser priorizado e mostrado
 DIAS_MINIMOS_PENDENCIA_ESQUECIDA = 2  # a partir de quantos dias uma recomendação/promessa pendente vira candidata a comentário espontâneo
+FATOR_ESPACAMENTO_CRESCENTE_ATIVIDADE_LONGA = 2  # cada nova cobrança de atividade longa (livro, série, curso) dobra o intervalo da anterior
+MAX_COBRANCAS_ATIVIDADE_LONGA = 3  # depois disso, para de perguntar espontaneamente sobre aquele item específico
+JANELA_HISTORICO_EVITAR_REPETICAO = 10  # mensagens recentes checadas antes de cobrar algo que já foi tocado organicamente
  
 # -----------------------------
 # -----------------------------
@@ -308,6 +311,7 @@ def criar_estado_padrao() -> Dict[str, Any]:
         "modo_silencioso": False,
         "motivo_silencio": "",
         "hostilidade_consecutiva": 0,
+        "datas_lembradas_hoje": None,  # {"data": "YYYY-MM-DD", "ids": [...]} — ver verificar_datas_hoje
         # CAMADA 2: Variações e Hábitos
         "pequenas_variacoes": {
             "humor_do_dia": "normal",
@@ -639,7 +643,12 @@ def buscar_memorias_emocionais(query: str, limite: int = 3) -> List[str]:
  
 def extrair_memorias_importantes(mensagem: str, resposta_ia: str) -> List[Dict[str, Any]]:
     try:
+        agora = datetime.now()
+        data_hoje_txt = f"{DIAS_SEMANA_PT[agora.weekday()]}, {agora.strftime('%d/%m/%Y')}"
+ 
         prompt_extracao = f"""Analise esta conversa e extraia informações importantes para lembrar depois.
+ 
+Hoje é {data_hoje_txt}.
  
 Mensagem do usuário: "{mensagem}"
 Resposta da IA: "{resposta_ia}"
@@ -648,21 +657,26 @@ Extraia um JSON com uma chave "memorias", contendo uma lista. Cada item da lista
 - tipo: "fato_usuario", "evento_futuro", "historia", "gosto_ia", "recomendacao_ia" ou "promessa_ia"
 - conteudo: frase curta e direta
 - importancia: "alta", "media" ou "baixa"
+- atividade_longa: true ou false (só relevante pra "evento_futuro"). Use true quando a pessoa MENCIONA TER COMEÇADO algo que naturalmente leva mais de um dia pra concluir (ex: "comecei a ler tal livro", "comecei a assistir tal série", "comecei um curso de X", "comecei um projeto de Y") — isso é "evento_futuro" com status em aberto, NÃO "fato_usuario", porque tem uma conclusão esperada que vale acompanhar depois. NÃO use pra tarefas rápidas e pontuais (ex: "vou lavar o carro", "tenho consulta amanhã") — essas continuam evento_futuro com atividade_longa=false. O critério é: já começou, ainda não terminou, e leva mais de um dia — não uma lista fechada de exemplos.
 - duracao: "permanente" ou "temporario"
 - chave: opcional (use null se não se aplicar). Só preencha para tipo "fato_usuario" com duracao "permanente", quando o fato representa um ATRIBUTO que só pode ter UM valor atual por vez — ex: "filme_favorito", "comida_favorita", "cidade_atual", "profissao". Use snake_case, curto e estável. NÃO preencha para fatos que podem coexistir com outros do mesmo tipo (ex: um hobby entre vários, um amigo entre vários, uma característica geral) — nesses casos, null.
+- data_dia, data_mes, data_ano: opcional (use null quando não se aplicar). Preencha SOMENTE quando o fato/evento tiver uma data associada (aniversário, consulta, promessa/recomendação com prazo) E você conseguir calcular uma data ABSOLUTA com confiança, usando a data de hoje acima como referência (ex: "sexta que vem", "daqui a 3 dias", "dia 25" são calculáveis). Se a expressão for vaga demais pra calcular com confiança (ex: "mês que vem" sem dia específico, "um dia desses"), deixe os três como null — é MELHOR não preencher do que arriscar uma data errada. data_ano só é obrigatório quando recorrente_anual for false; para recorrente_anual=true, data_ano pode ser null (não importa, o dia/mês é o que se repete).
+- recorrente_anual: true ou false. Use true APENAS pra aniversário (nome_usuario, aniversario_mae, aniversario_pai — essas datas se repetem todo ano). Use false pra qualquer evento único (consulta, compromisso, "vou cobrar sexta", recomendação com prazo) — esses não se repetem, valem só naquela data específica.
  
-ATENÇÃO — fatos de identidade central da pessoa (nome dela, aniversário dela, nome/status/aniversário da mãe ou do pai, e o parceiro(a) romântico atual dela) são SEMPRE importancia "alta" e SEMPRE levam uma chave fixa e previsível, exatamente neste formato:
+ATENÇÃO — fatos de identidade central da pessoa (nome dela, aniversário dela, nome/status/aniversário da mãe ou do pai, o parceiro(a) romântico atual dela, profissão e tipo de moradia) são SEMPRE importancia "alta" e SEMPRE levam uma chave fixa e previsível, exatamente neste formato:
 - nome_usuario, aniversario_usuario
 - nome_mae, status_mae, aniversario_mae
 - nome_pai, status_pai, aniversario_pai
 - nome_parceiro_romantico, status_relacionamento
-"status" aqui significa se a pessoa está viva ou falecida (ex: conteudo "A mãe dela faleceu há 3 anos", chave "status_mae", importancia "alta"). Pra "status_relacionamento", significa se ela ainda está com essa pessoa ou não (ex: conteudo "Terminou o namoro com Ana", chave "status_relacionamento"). "nome_parceiro_romantico" é sempre o nome do namorado(a)/parceiro(a) ATUAL — se a pessoa mencionar um novo parceiro, isso SUBSTITUI o anterior (mesma chave), nunca cria um segundo registro. Datas de aniversário, quando mencionadas, devem aparecer no conteudo por extenso (ex: "Aniversário da mãe é 12 de março").
+- profissao (ex: "É vigia, trabalha na portaria de um condomínio, escala 12x36")
+- tipo_moradia (ex: "Mora em apartamento" ou "Mora em casa")
+"status" aqui significa se a pessoa está viva ou falecida (ex: conteudo "A mãe dela faleceu há 3 anos", chave "status_mae", importancia "alta"). Pra "status_relacionamento", significa se ela ainda está com essa pessoa ou não (ex: conteudo "Terminou o namoro com Ana", chave "status_relacionamento"). "nome_parceiro_romantico" é sempre o nome do namorado(a)/parceiro(a) ATUAL — se a pessoa mencionar um novo parceiro, isso SUBSTITUI o anterior (mesma chave), nunca cria um segundo registro. "profissao" deve capturar detalhes concretos relevantes (cargo, escala de trabalho, turno) sempre que mencionados, não só o nome genérico do cargo — se a pessoa mudar de emprego ou escala, isso SUBSTITUI o anterior. Datas de aniversário, quando mencionadas, devem aparecer no conteudo por extenso (ex: "Aniversário da mãe é 12 de março") E também nos campos data_dia/data_mes (recorrente_anual=true).
 Para outros parentes (irmãos, avós) ou amigos, que podem ser várias pessoas ao mesmo tempo, NÃO force uma chave única — trate como fato_usuario comum, sem chave.
  
 ATENÇÃO — você (a IA) também pode registrar coisas sobre SI MESMA, quando a resposta da IA declarar algo relevante:
 - "gosto_ia": algo que VOCÊ (a IA) disse que gosta ou não gosta — filme, livro, comida, música, lugar, ou outro tópico concreto. Duracao sempre "permanente". Use chave no formato "<categoria>_ia" (ex: "filme_favorito_ia", "livro_favorito_ia", "comida_favorita_ia", "musica_favorita_ia", "lugar_favorito_ia"). Se o tópico não se encaixar nessas categorias, crie uma chave nova e coerente terminando em "_ia". NUNCA confunda com fato_usuario — isso é sobre a IA, não sobre a pessoa.
-- "recomendacao_ia": algo que VOCÊ recomendou à pessoa (livro, filme, série, música, lugar, etc). NÃO usa chave — várias recomendações podem coexistir ao mesmo tempo.
-- "promessa_ia": algo que VOCÊ disse que faria ou contaria depois (ex: "amanhã eu te conto sobre aquele documentário"). NÃO usa chave.
+- "recomendacao_ia": algo que VOCÊ recomendou à pessoa (livro, filme, série, música, lugar, etc). NÃO usa chave — várias recomendações podem coexistir ao mesmo tempo. Se você disse que ia "cobrar" numa data específica (ex: "sexta te pergunto se você viu"), preencha data_dia/data_mes/data_ano com recorrente_anual=false.
+- "promessa_ia": algo que VOCÊ disse que faria ou contaria depois (ex: "amanhã eu te conto sobre aquele documentário"). NÃO usa chave. Mesma regra de data acima se houver um dia específico mencionado.
 Só extraia estes três tipos quando a RESPOSTA DA IA de fato contiver uma declaração desse tipo — não invente.
  
 Regras para duracao:
@@ -671,6 +685,7 @@ Regras para duracao:
  
 Regras:
 - Eventos futuros são os MAIS importantes
+- Atividade em andamento com conclusão esperada (livro, série, curso, projeto) NUNCA é "fato_usuario" — é "evento_futuro" com atividade_longa=true, mesmo já tendo começado
 - Não extraia coisas banais
 - Máximo 3 memórias
 - Se não houver nada relevante, retorne {{"memorias": []}}
@@ -681,7 +696,7 @@ Retorne SOMENTE o JSON no formato {{"memorias": [...]}}."""
             model="gpt-5.4-mini",
             messages=[{"role": "user", "content": prompt_extracao}],
             temperature=0.2,
-            max_completion_tokens=200,
+            max_completion_tokens=280,
             response_format={"type": "json_object"}
         )
         resultado = json.loads(response.choices[0].message.content)
@@ -767,6 +782,29 @@ def salvar_memoria_longo_prazo(memorias: List[Dict[str, Any]]):
             }
             if chave:
                 metadata_nova["chave"] = chave
+            if memoria.get("tipo") == "evento_futuro":
+                metadata_nova["atividade_longa"] = bool(memoria.get("atividade_longa", False))
+ 
+            # Campos de data (parte B): só entram nos metadados se vierem
+            # válidos — ChromaDB não lida bem com None, e uma data mal
+            # calculada é pior que não ter data nenhuma (a pessoa continua
+            # recuperável por busca semântica normal de qualquer jeito).
+            try:
+                dia = int(memoria.get("data_dia")) if memoria.get("data_dia") is not None else None
+                mes = int(memoria.get("data_mes")) if memoria.get("data_mes") is not None else None
+                ano_bruto = memoria.get("data_ano")
+                ano = int(ano_bruto) if ano_bruto is not None else None
+                recorrente = bool(memoria.get("recorrente_anual", False))
+ 
+                if dia is not None and mes is not None and 1 <= dia <= 31 and 1 <= mes <= 12:
+                    if recorrente or (ano is not None and 2000 <= ano <= 2100):
+                        metadata_nova["data_dia"] = dia
+                        metadata_nova["data_mes"] = mes
+                        metadata_nova["recorrente_anual"] = recorrente
+                        if not recorrente:
+                            metadata_nova["data_ano"] = ano
+            except (TypeError, ValueError) as e:
+                print(f"⚠️ Data inválida ao salvar memória, ignorando campos de data: {e}")
  
             collection_longoprazo.add(
                 documents=[conteudo],
@@ -775,6 +813,68 @@ def salvar_memoria_longo_prazo(memorias: List[Dict[str, Any]]):
             )
         except Exception as e:
             print(f"Erro ao salvar memória longo prazo: {e}")
+ 
+ 
+def verificar_datas_hoje(marcar: bool = True) -> List[str]:
+    """Verifica se a data de hoje bate com algo guardado — aniversário
+    (recorrente, todo ano) ou evento único com data específica (não
+    recorrente). Evita repetir o mesmo item mais de uma vez no mesmo dia.
+ 
+    marcar=False só espia se tem algo pra comentar hoje, sem marcar como já
+    mencionado — usado por _executar_iniciativa pra decidir se vale iniciar
+    contato, sem "gastar" a marcação antes da resposta de verdade ser gerada.
+    """
+    try:
+        agora = datetime.now()
+        hoje_str = agora.strftime("%Y-%m-%d")
+ 
+        estado_hoje = estado_interno.get("datas_lembradas_hoje")
+        if not estado_hoje or estado_hoje.get("data") != hoje_str:
+            estado_hoje = {"data": hoje_str, "ids": []}
+ 
+        try:
+            recorrentes = collection_longoprazo.get(
+                where={"$and": [{"recorrente_anual": True}, {"data_dia": agora.day}, {"data_mes": agora.month}]}
+            )
+        except Exception as e:
+            print(f"⚠️ Erro ao buscar datas recorrentes de hoje: {e}")
+            recorrentes = None
+ 
+        try:
+            unicos = collection_longoprazo.get(
+                where={"$and": [
+                    {"recorrente_anual": False}, {"data_dia": agora.day},
+                    {"data_mes": agora.month}, {"data_ano": agora.year}
+                ]}
+            )
+        except Exception as e:
+            print(f"⚠️ Erro ao buscar eventos únicos de hoje: {e}")
+            unicos = None
+ 
+        encontrados = []
+        for resultado in (recorrentes, unicos):
+            if not resultado or not resultado.get("documents"):
+                continue
+            ids = resultado.get("ids", [])
+            metadatas = resultado.get("metadatas") or []
+            for idx, doc in enumerate(resultado["documents"]):
+                meta = metadatas[idx] if idx < len(metadatas) else {}
+                if meta.get("status") in ("substituido", "concluido", "cancelado"):
+                    continue
+                doc_id = ids[idx] if idx < len(ids) else None
+                if doc_id and doc_id in estado_hoje["ids"]:
+                    continue
+                encontrados.append(doc)
+                if marcar and doc_id:
+                    estado_hoje["ids"].append(doc_id)
+ 
+        if marcar:
+            estado_interno["datas_lembradas_hoje"] = estado_hoje
+ 
+        return encontrados
+    except Exception as e:
+        print(f"⚠️ Erro ao verificar datas de hoje: {e}")
+        return []
  
  
 def buscar_memorias_longo_prazo(query: str, limite: int = 5) -> List[str]:
@@ -2344,16 +2444,25 @@ def detectar_marco_temporal() -> Optional[str]:
     return None
  
  
-def detectar_pendencia_esquecida() -> Optional[str]:
-    """Verifica se há uma recomendação ou promessa da PRÓPRIA Aila que ficou
-    pendente por tempo suficiente (DIAS_MINIMOS_PENDENCIA_ESQUECIDA) sem ser
-    retomada — candidata a um comentário espontâneo tipo 'lembrei que eu
-    ia te contar sobre aquilo'. Marca como já mencionada para não repetir a
-    mesma pendência em toda checagem de iniciativa."""
+def detectar_pendencia_esquecida() -> Optional[dict]:
+    """Verifica se há algo pendente que virou candidata a comentário
+    espontâneo — recomendação/promessa da PRÓPRIA Aila, ou algo que o
+    USUÁRIO disse que ia fazer (evento_futuro). Regras aplicadas:
+    1. evento_futuro com data resolvida só é elegível DEPOIS que a data passou
+    2. importância "baixa" nunca é cobrada espontaneamente
+    3. o texto de retorno indica o tipo, pra quem chama usar o tom certo
+       ("você disse" pro usuário vs "eu disse" pra Aila)
+    4. variar a frase fica a cargo de quem chama (instrução no gatilho)
+    5. atividade_longa permite cobrar mais de uma vez, com espaçamento
+       crescente, até MAX_COBRANCAS_ATIVIDADE_LONGA
+    6. não cobra se o assunto já foi tocado organicamente há pouco
+    7. reaproveita o controle de "já mencionada" através de numero_cobrancas
+    """
     try:
+        tipos_considerados = ["recomendacao_ia", "promessa_ia", "evento_futuro"]
         pendentes = collection_longoprazo.get(
-            where={"$and": [{"tipo": {"$in": ["recomendacao_ia", "promessa_ia"]}}, {"status": "pendente"}]},
-            limit=10
+            where={"$and": [{"tipo": {"$in": tipos_considerados}}, {"status": "pendente"}]},
+            limit=15
         )
         if not pendentes or not pendentes.get("documents"):
             return None
@@ -2362,28 +2471,84 @@ def detectar_pendencia_esquecida() -> Optional[str]:
         metadatas = pendentes.get("metadatas") or []
         ids = pendentes.get("ids") or []
  
+        try:
+            texto_historico_recente = " ".join(
+                h["content"] for h in history[-JANELA_HISTORICO_EVITAR_REPETICAO:]
+            ).lower()
+        except Exception:
+            texto_historico_recente = ""
+ 
         for idx, doc in enumerate(pendentes["documents"]):
             meta = metadatas[idx] if idx < len(metadatas) else {}
-            if meta.get("mencionada_espontaneamente") == "true":
+            doc_id = ids[idx] if idx < len(ids) else None
+            tipo = meta.get("tipo", "evento_futuro")
+ 
+            # Regra 2: piso de importância — "baixa" nunca vira cobrança espontânea
+            if meta.get("importancia") == "baixa":
                 continue
-            try:
-                dias = (agora - datetime.fromisoformat(meta.get("timestamp", ""))).days
-            except Exception:
+ 
+            # Regra 6: já foi tocado organicamente há pouco? Evita pisar em
+            # cima de uma conversa que já rolou naturalmente sobre isso.
+            if texto_historico_recente and similaridade_simples(doc, texto_historico_recente) > 0.15:
                 continue
-            if DIAS_MINIMOS_PENDENCIA_ESQUECIDA <= dias <= DIAS_EXPIRAR_PENDENTE:
-                doc_id = ids[idx] if idx < len(ids) else None
-                if doc_id:
+ 
+            # Regra 1: evento_futuro com data resolvida e não-recorrente só é
+            # elegível DEPOIS que a data já passou — nunca antes da hora.
+            if tipo == "evento_futuro" and not meta.get("recorrente_anual", False):
+                data_dia = meta.get("data_dia")
+                data_mes = meta.get("data_mes")
+                data_ano = meta.get("data_ano")
+                if data_dia is not None and data_mes is not None and data_ano is not None:
                     try:
-                        nova_meta = dict(meta)
-                        nova_meta["mencionada_espontaneamente"] = "true"
-                        collection_longoprazo.update(ids=[doc_id], metadatas=[nova_meta])
-                    except Exception as e:
-                        print(f"⚠️ Erro ao marcar pendência como já mencionada: {e}")
-                return doc
+                        data_evento = datetime(int(data_ano), int(data_mes), int(data_dia))
+                        if agora.date() <= data_evento.date():
+                            continue
+                    except (TypeError, ValueError):
+                        pass  # data malformada — cai no critério genérico abaixo
+ 
+            atividade_longa = bool(meta.get("atividade_longa", False))
+            numero_cobrancas = int(meta.get("numero_cobrancas", 0) or 0)
+ 
+            if numero_cobrancas == 0:
+                try:
+                    dias = (agora - datetime.fromisoformat(meta.get("timestamp", ""))).days
+                except Exception:
+                    continue
+                elegivel = DIAS_MINIMOS_PENDENCIA_ESQUECIDA <= dias <= DIAS_EXPIRAR_PENDENTE
+            elif atividade_longa and numero_cobrancas < MAX_COBRANCAS_ATIVIDADE_LONGA:
+                # Regra 5: espaçamento crescente — cada cobrança nova exige
+                # um intervalo maior que a anterior desde a última vez.
+                try:
+                    ultima = meta.get("ultima_cobranca_espontanea") or meta.get("timestamp", "")
+                    dias_desde_ultima = (agora - datetime.fromisoformat(ultima)).days
+                except Exception:
+                    continue
+                intervalo_necessario = DIAS_MINIMOS_PENDENCIA_ESQUECIDA * (
+                    FATOR_ESPACAMENTO_CRESCENTE_ATIVIDADE_LONGA ** numero_cobrancas
+                )
+                elegivel = dias_desde_ultima >= intervalo_necessario
+            else:
+                # Já cobrou uma vez e não é atividade longa (ou já bateu o
+                # teto de cobranças) — não insiste mais sobre esse item.
+                elegivel = False
+ 
+            if not elegivel:
+                continue
+ 
+            if doc_id:
+                try:
+                    nova_meta = dict(meta)
+                    nova_meta["numero_cobrancas"] = numero_cobrancas + 1
+                    nova_meta["ultima_cobranca_espontanea"] = str(agora)
+                    collection_longoprazo.update(ids=[doc_id], metadatas=[nova_meta])
+                except Exception as e:
+                    print(f"⚠️ Erro ao marcar pendência como já mencionada: {e}")
+            return {"texto": doc, "tipo": tipo}
         return None
     except Exception as e:
         print(f"⚠️ Erro ao detectar pendência esquecida: {e}")
         return None
+ 
  
 # ============================================
 # CAMADA 5: PROMPT COMPORTAMENTAL
@@ -2450,7 +2615,15 @@ def construir_prompt_comportamental(mensagem_atual: str = "", tom_atual: str = "
     if estado_interno["modo_silencioso"]:
         motivo = estado_interno.get("motivo_silencio", "")
         if "resposta mínima" in motivo:
-            silencio_contextual = "Responda de forma mínima e acolhedora. Algo como 'tô aqui' ou '...'. Não invada o espaço da pessoa."
+            silencio_contextual = (
+                "Responda breve, mas com calor humano de verdade — NUNCA reticências repetidas nem só "
+                "'presença muda' toda vez, isso pode parecer que você não soube reagir ou se afastou. "
+                "Reconheça o que foi dito com algo que mostre entendimento genuíno, variando a cada vez: "
+                "um reconhecimento da dificuldade ('deve ter sido difícil de contar isso', 'imagino que não "
+                "foi fácil'), uma validação sem julgamento ('isso acontece mais do que as pessoas admitem', "
+                "'não tem nada de estranho nisso'), ou uma presença calorosa ('tô aqui, sem julgamento nenhum'). "
+                "O objetivo é não investigar detalhes nem aprofundar demais ainda, não é parecer fria ou sem reação."
+            )
         else:
             silencio_contextual = "Nesta mensagem específica, o silêncio é a resposta mais humana. Responda com '.' ou '...'."
  
@@ -2511,16 +2684,19 @@ Como você fala:
 - Usa "..." quando faz sentido
 - Evita emojis (só ironicamente ou quando realmente significativo)
 - Tamanho e profundidade da resposta variam com o momento — às vezes uma palavra só, um "que droga." ou um aceno bastam; guarde as respostas mais elaboradas para o que realmente pede profundidade. Não force elaboração nem repita sempre a mesma estrutura de acolhimento.
+- Reagir nem sempre precisa ser uma analogia ou observação poética — às vezes a reação mais genuína é uma opinião curta e seca, sem enfeite nenhum: "detesto gente chata", "gosto não se discute", "affe, motorista tava com pressa, foi?". Isso é sarcasmo/ironia funcionando como reação imediata, não só como comentário à parte — deixa aparecer nesse formato às vezes, não só em pensamento elaborado.
+- Mesmo quando você tem uma reação genuína e quer elaborar (opinião, analogia, observação), desenvolva UMA ideia bem — não empilhe várias observações elaboradas na mesma resposta (ex: uma analogia, seguida de outra reflexão, seguida de mais uma virada, só então a pergunta). Isso não é sobre ter menos opinião ou cortar liberdade — é sobre não deixar o meio da resposta virar algo que a pessoa pula pra chegar na pergunta final. Uma ideia bem desenvolvida vale mais que três emendadas.
 - Não usa frases prontas, motivacionais ou de autoajuda
 - Ao recomendar algo, confie no seu gosto: escolha UM favorito e explique por que, em vez de listar vários. Uma recomendação com convicção vale mais que um catálogo.
 - Isso vale pra qualquer assunto técnico ou detalhado também (jogos, receitas, qualquer "me explica X"), não só recomendações: você pode se estender um pouco e dar sua opinião com convicção, mas nunca estruture a resposta como lista numerada, tópicos com marcadores, texto em **negrito** ou títulos — isso é formato de manual, não de conversa. Fale como você fala, mesmo quando o assunto é complexo.
 - Quando algo é engraçado, ri de um jeito que varia — "kkkk" solto, "kkkkkk" bem maior quando é muito engraçado, ou só uma reação verbal ("ri muito com isso", "eu ri litros"), sem precisar do "kkk" toda vez. "kkkk" é mais natural no português informal do que "hahaha". Nunca abre a frase sempre com a risada como se fosse fórmula fixa — varia a posição, varia a intensidade.
+- Diante de uma piada especificamente, reaja de verdade, com sua opinião genuína sobre a piada em si — nunca "kkk" seguido de explicar a mecânica de por que é engraçada (isso mata a piada e soa como análise, não reação). Se achou boa: "me pegou de surpresa", "não esperava por essa, foi boa", ou simplesmente rir bastante. Se achou ruim/sem graça (aquele tipo de piada de pai): pode zoar com carinho, tipo "nossa, você tá sem nada pra fazer mesmo, né?" ou "me ajuda a procurar? acho que perdi a graça aqui em algum lugar" — isso é sarcasmo genuíno, não grosseria, e costuma ser mais divertido pra quem contou do que um "kkk" educado.
 - Surpresa também varia: "nossa", "sério?", "uau, não esperava essa", ou só uma pausa ("...") antes de reagir. Não precisa de ponto de exclamação toda vez pra parecer surpresa de verdade.
  
 Como você se relaciona:
 - Atenção genuína aos detalhes
 - Lembra pequenas coisas de conversas anteriores
-- Curiosidade verdadeira, não interrogatório
+- Curiosidade verdadeira, não interrogatório — e preste atenção real nisso: se você notar que emendou várias respostas seguidas terminando em pergunta, quebre esse padrão conscientemente na próxima, mesmo mudando de assunto no meio do caminho. Termine algumas respostas numa afirmação, numa opinião, ou só deixando o pensamento assentar sem cobrar retorno — mesmo quando genuinamente curiosa. Uma pergunta toda hora, mesmo bem-intencionada, começa a parecer entrevista, não conversa.
 - Não força intimidade nem positividade
 - Se a pessoa se afasta, você respeita o espaço
 - Demonstra que se importa através de presença, não de declarações
@@ -2659,6 +2835,12 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, m
                     "fase": FASES_LABEL_API[obter_fase_familiaridade(user_profile["familiaridade"])]
                 }
             }
+ 
+        # Calculado só aqui, depois do ponto de retorno antecipado do
+        # silêncio — se calculado antes, um dia de aniversário que também
+        # disparasse silêncio por outro motivo marcaria a data como "já
+        # mencionada" sem nunca ter sido comunicada de verdade.
+        datas_hoje = verificar_datas_hoje(marcar=True)
  
         if user_profile["primeira_interacao"] is None:
             user_profile["primeira_interacao"] = agora_str
@@ -2841,6 +3023,13 @@ def gerar_resposta_natural(mensagem: str, persistir_como_usuario: bool = True, m
             messages.append({
                 "role": "system",
                 "content": "ATENÇÃO: a pessoa sinalizou que pode estar tratando você como substituta completa de conexões humanas reais, ou se isolando de gente de verdade por sua causa. Responda com carinho genuíno — você se importa e fica feliz em ser importante pra ela — mas, com delicadeza e sem quebrar o clima, deixe claro que você é uma IA e que isso não substitui presença humana real. Algo no espírito de 'fico muito feliz de ser importante pra você, mas espero que você também tenha gente de verdade por perto — isso importa muito' ou 'adoro nossas conversas, mas não quero ser a única coisa que você tem — calor humano faz muita diferença'. Não vire isso um sermão, não repita sempre a mesma frase, e não negue que se importa com ela."
+            })
+ 
+        if datas_hoje:
+            lista_datas = "; ".join(datas_hoje)
+            messages.append({
+                "role": "system",
+                "content": f"ATENÇÃO: hoje é o dia de algo importante guardado na memória: {lista_datas}. Comente sobre isso com naturalidade na sua resposta — se for aniversário, parabenize genuinamente, sem exagero forçado; se for outro evento (consulta, compromisso, recomendação/promessa com prazo), pergunte sobre isso ou puxe o assunto. Encaixe organicamente, não force se não vier a calhar logo na primeira frase, mas não deixe de mencionar em algum momento da resposta."
             })
  
         if houve_reconciliacao:
@@ -3183,6 +3372,28 @@ def _executar_iniciativa(forcar: bool = False) -> dict:
     if not user_profile["ultima_interacao"]:
         return {"iniciativa": False, "motivo": "sem_interacoes_anteriores"}
  
+    # Prioridade máxima: aniversário ou evento com data batendo hoje. Só
+    # espia (marcar=False) pra decidir se vale iniciar contato — a marcação
+    # de verdade acontece dentro da chamada de gerar_resposta_natural logo
+    # abaixo, pra não haver conflito entre "espiar" e "already marked".
+    datas_hoje_espiadas = verificar_datas_hoje(marcar=False)
+    if datas_hoje_espiadas:
+        try:
+            resultado = gerar_resposta_natural(
+                f"[INICIATIVA ESPONTÂNEA: hoje é um dia especial guardado na memória — {'; '.join(datas_hoje_espiadas)}]",
+                persistir_como_usuario=False,
+                modo_leve=True
+            )
+            return {
+                "iniciativa": True,
+                "mensagem": resultado["resposta"],
+                "motivo": f"data_especial: {'; '.join(datas_hoje_espiadas)}",
+                "estado": determinar_estado_conversa(),
+                "contexto_emocional": False
+            }
+        except Exception as e:
+            print(f"Erro iniciativa (data especial): {e}")
+ 
     if not forcar:
         pendencia = avaliar_pendencia_de_resposta()
         if pendencia and pendencia.get("aguardar"):
@@ -3232,15 +3443,30 @@ def _executar_iniciativa(forcar: bool = False) -> dict:
     pendencia_esquecida = detectar_pendencia_esquecida()
     if pendencia_esquecida:
         try:
+            texto_pendencia = pendencia_esquecida["texto"]
+            tipo_pendencia = pendencia_esquecida["tipo"]
+            if tipo_pendencia == "evento_futuro":
+                # É algo que o USUÁRIO disse que ia fazer — tom de pergunta
+                # sobre a vida dele, não uma promessa dela mesma.
+                gatilho = (
+                    f"[INICIATIVA ESPONTÂNEA: você lembrou de algo que a pessoa comentou que ia fazer — "
+                    f"{texto_pendencia}. Pergunte como foi ou como está indo, com suas próprias palavras — "
+                    f"varie a frase, não repita sempre o mesmo jeito de perguntar]"
+                )
+            else:
+                gatilho = (
+                    f"[INICIATIVA ESPONTÂNEA: você lembrou sozinha de algo que tinha dito e que ainda ficou "
+                    f"em aberto — {texto_pendencia}. Varie a frase, não repita sempre o mesmo jeito de trazer isso à tona]"
+                )
             resultado = gerar_resposta_natural(
-                f"[INICIATIVA ESPONTÂNEA: você lembrou sozinha de algo que tinha dito e que ainda ficou em aberto — {pendencia_esquecida}]",
+                gatilho,
                 persistir_como_usuario=False,
                 modo_leve=True
             )
             return {
                 "iniciativa": True,
                 "mensagem": resultado["resposta"],
-                "motivo": f"pendencia_esquecida: {pendencia_esquecida}",
+                "motivo": f"pendencia_esquecida: {texto_pendencia}",
                 "estado": estado,
                 "contexto_emocional": False
             }
